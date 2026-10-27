@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpaceCraft 3D — 웹 기반 3D 인테리어 및 공간 시뮬레이션 플랫폼</title>
+  <link rel="stylesheet" href="style.css" />
+  <!-- Google Fonts: Inter & Pretendard alternative -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Three.js & OrbitControls via CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+  <div id="app-container">
+    <!-- ==================== 상단 헤더 ==================== -->
+    <header id="top-header">
+      <div class="header-left">
+        <div class="brand-logo">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+            <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+            <line x1="12" y1="22.08" x2="12" y2="12"></line>
+          </svg>
+          <span class="brand-title">SpaceCraft <strong>3D</strong></span>
+          <span class="brand-badge">CAD &amp; AI Studio</span>
+        </div>
+        <div class="scale-indicator">
+          <span>Scale: <code>1000mm = 1.0m (1 unit)</code></span>
+        </div>
+      </div>
+
+      <!-- 중앙 모드 전환 스위치 -->
+      <div class="header-center">
+        <div class="mode-switch-group" role="group" aria-label="뷰포트 모드 전환">
+          <button id="btn-mode-2d" class="mode-btn" data-mode="2d">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/>
+            </svg>
+            2D 단면도 편집 모드
+          </button>
+          <button id="btn-mode-3d" class="mode-btn active" data-mode="3d">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+            </svg>
+            3D 시뮬레이션 모드
+          </button>
+        </div>
+      </div>
+
+      <!-- 우측 유틸리티 버튼 -->
+      <div class="header-right">
+        <label class="toggle-chip" title="시야를 가리는 전면 벽체를 자동으로 반투명/낮게 처리합니다">
+          <input type="checkbox" id="chk-auto-cutaway" checked />
+          <span>전면 벽 반투명 시야 확보</span>
+        </label>
+        <button id="btn-reset-camera" class="header-action-btn" title="카메라 시점 초기화">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>
+          </svg>
+          시점 초기화
+        </button>
+        <div class="divider-v"></div>
+        <button id="btn-save-state" class="header-action-btn" title="현재 도면 및 가구 배치를 브라우저에 저장">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
+          </svg>
+          저장
+        </button>
+        <button id="btn-load-state" class="header-action-btn" title="저장된 인테리어 상태 불러오기">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          불러오기
+        </button>
+      </div>
+    </header>
+
+    <!-- ==================== 메인 대시보드 바디 ==================== -->
+    <div id="main-workspace">
+      <!-- ==================== 좌측 사이드바 (3탭 구조) ==================== -->
+      <aside id="left-sidebar">
+        <div class="sidebar-tabs">
+          <button class="sidebar-tab active" data-tab="tab-floorplan">
+            <span class="tab-num">1</span>
+            <span>집 구조/단면도</span>
+          </button>
+          <button class="sidebar-tab" data-tab="tab-catalog">
+            <span class="tab-num">2</span>
+            <span>가구 카탈로그</span>
+          </button>
+          <button class="sidebar-tab" data-tab="tab-ai-studio">
+            <span class="tab-num">3</span>
+            <span>AI 가구 생성기</span>
+          </button>
+        </div>
+
+        <!-- [탭 1] 집 구조 / 단면도 설정 -->
+        <div id="tab-floorplan" class="tab-panel active">
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>한국 주거 형태 프리셋</h3>
+              <span class="section-sub">클릭 시 즉시 2D/3D 구조 생성</span>
+            </div>
+            <div class="preset-grid">
+              <button class="preset-card active" data-preset="studio">
+                <div class="preset-badge">① 원룸 오픈형</div>
+                <div class="preset-title">오픈형 스튜디오</div>
+                <div class="preset-dim">3500 × 4500 mm</div>
+              </button>
+              <button class="preset-card" data-preset="onehalf">
+                <div class="preset-badge">② 분리형 1.5룸</div>
+                <div class="preset-title">침실·거실 가벽 분리</div>
+                <div class="preset-dim">5200 × 4200 mm</div>
+              </button>
+              <button class="preset-card" data-preset="aptbed">
+                <div class="preset-badge">③ 84㎡ 아파트 침실</div>
+                <div class="preset-title">국민평형 마스터룸</div>
+                <div class="preset-dim">3600 × 3900 mm</div>
+              </button>
+              <button class="preset-card" data-preset="lshape">
+                <div class="preset-badge">④ ㄱ자형 구조</div>
+                <div class="preset-title">코너 테라스/다이닝형</div>
+                <div class="preset-dim">5000 × 4800 mm</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>방 규격 직접 설정 (mm)</h3>
+              <span class="section-sub">직사각형 방 치수 및 층고 즉시 반영</span>
+            </div>
+            <div class="form-row-3">
+              <div class="input-group">
+                <label for="room-width-input">가로 (W)</label>
+                <input type="number" id="room-width-input" value="3500" min="1500" max="12000" step="100" />
+              </div>
+              <div class="input-group">
+                <label for="room-depth-input">세로 (D)</label>
+                <input type="number" id="room-depth-input" value="4500" min="1500" max="12000" step="100" />
+              </div>
+              <div class="input-group">
+                <label for="room-height-input">천장고 (H)</label>
+                <input type="number" id="room-height-input" value="2400" min="2000" max="4500" step="50" />
+              </div>
+            </div>
+            <div class="form-row-2" style="margin-top:8px;">
+              <div class="input-group">
+                <label for="wall-thickness-input">벽체 두께 (mm)</label>
+                <input type="number" id="wall-thickness-input" value="160" min="80" max="400" step="10" />
+              </div>
+              <div class="input-group" style="justify-content:flex-end;">
+                <button id="btn-apply-room-dim" class="primary-btn full-width">치수 규격 적용</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>2D 단면도 직접 그리기 도구</h3>
+              <span class="section-sub">2D 모드에서 격자 위에 직접 설계</span>
+            </div>
+            <div class="tool-palette">
+              <button class="draw-tool-btn active" data-tool="select">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/></svg>
+                <span>선택 / 이동</span>
+              </button>
+              <button class="draw-tool-btn" data-tool="wall">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="20" x2="20" y2="4"/><circle cx="4" cy="20" r="2.5"/><circle cx="20" cy="4" r="2.5"/></svg>
+                <span>벽(Wall) 그리기</span>
+              </button>
+              <button class="draw-tool-btn" data-tool="door">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20h16"/><path d="M6 20V6a14 14 0 0 1 14 14"/></svg>
+                <span>방문(Door) 배치</span>
+              </button>
+              <button class="draw-tool-btn" data-tool="window">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="1"/><line x1="12" y1="6" x2="12" y2="18"/></svg>
+                <span>창문(Window) 배치</span>
+              </button>
+              <button class="draw-tool-btn danger-outline" data-tool="erase">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14H7L5 6"/></svg>
+                <span>요소 삭제</span>
+              </button>
+            </div>
+            <div class="floorplan-help-box">
+              <p>• <strong>벽 그리기:</strong> 2D 캔버스에서 마우스 클릭 후 드래그하여 새 벽체를 추가합니다 (100mm 스냅).</p>
+              <p>• <strong>문/창문 배치:</strong> 벽체 위를 클릭하면 해당 위치에 방문(개폐 반경 900mm 포함) 또는 창문이 장착됩니다.</p>
+              <div style="display:flex; gap:6px; margin-top:8px;">
+                <button id="btn-open-2d-editor" class="secondary-btn full-width">2D 편집 모드로 전환</button>
+                <button id="btn-clear-2d-walls" class="secondary-btn" title="모든 벽/문 초기화">초기화</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- [탭 2] 기본 가구 카탈로그 -->
+        <div id="tab-catalog" class="tab-panel">
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>기본 3D 가구 카탈로그</h3>
+              <span class="section-sub">클릭하면 공간 중앙에 즉시 배치됩니다</span>
+            </div>
+            <div id="catalog-list" class="catalog-grid">
+              <!-- JS에서 동적으로 렌더링 -->
+            </div>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>내 AI 커스텀 가구 보관함</h3>
+              <span class="section-sub">AI 스튜디오에서 생성한 맞춤형 가구</span>
+            </div>
+            <div id="ai-vault-list" class="catalog-grid">
+              <div class="empty-vault-msg">아직 생성된 AI 가구가 없습니다.<br/>[3. AI 가구 생성기] 탭에서 나만의 가구를 만들어보세요.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- [탭 3] AI 커스텀 가구 생성기 -->
+        <div id="tab-ai-studio" class="tab-panel">
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>AI 3D 가구 생성 스튜디오</h3>
+              <span class="section-sub">참고 사진 텍스처 추출 + 절차적 3D 메쉬 합성</span>
+            </div>
+
+            <!-- 1. 가구 참고 이미지 업로드 -->
+            <div class="input-group">
+              <label>1. 가구 참고 이미지 업로드 (선택/권장)</label>
+              <div id="ai-dropzone" class="dropzone">
+                <input type="file" id="ai-image-input" accept="image/*" hidden />
+                <div id="ai-dropzone-prompt" class="dropzone-prompt">
+                  <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#8E929F" stroke-width="1.8">
+                    <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
+                  </svg>
+                  <span>클릭하거나 가구 이미지를 드래그 앤 드롭</span>
+                  <small>주요 색상(Dominant Color) 및 표면 텍스처 자동 추출</small>
+                </div>
+                <div id="ai-preview-wrap" class="dropzone-preview hidden">
+                  <img id="ai-preview-img" alt="업로드 미리보기" />
+                  <div class="preview-meta">
+                    <span id="ai-extracted-swatch" class="color-swatch"></span>
+                    <span id="ai-extracted-hex">#8B6F4E</span>
+                    <button type="button" id="btn-remove-ai-img" class="mini-btn">제거</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 2. 가구 이름 및 카테고리 -->
+            <div class="input-group" style="margin-top:10px;">
+              <label for="ai-furn-name">2. 가구 이름</label>
+              <input type="text" id="ai-furn-name" placeholder="예: 원목 라운드 다이닝 테이블" value="북유럽 원목 커스텀 테이블" />
+            </div>
+
+            <div class="input-group" style="margin-top:10px;">
+              <label for="ai-furn-category">3. 가구 카테고리</label>
+              <select id="ai-furn-category">
+                <option value="desk">책상 / 테이블 (Desk &amp; Table)</option>
+                <option value="chair">의자 / 소파 (Chair &amp; Sofa)</option>
+                <option value="bed">침대 (Bed Frame &amp; Mattress)</option>
+                <option value="wardrobe">수납장 / 옷장 (Cabinet &amp; Wardrobe)</option>
+                <option value="appliance">가전제품 (Refrigerator / TV / Washer)</option>
+                <option value="decor">기타 소품 / 조명 (Decor &amp; Planter)</option>
+              </select>
+            </div>
+
+            <!-- 3. 기본 치수 입력 (mm 단위) -->
+            <div class="input-group" style="margin-top:10px;">
+              <label>4. 실제 규격 치수 입력 (mm 단위)</label>
+              <div class="form-row-3">
+                <div class="input-group">
+                  <label for="ai-dim-w">가로 (W)</label>
+                  <input type="number" id="ai-dim-w" value="1400" min="200" max="4000" step="50" />
+                </div>
+                <div class="input-group">
+                  <label for="ai-dim-d">세로/깊이 (D)</label>
+                  <input type="number" id="ai-dim-d" value="800" min="200" max="4000" step="50" />
+                </div>
+                <div class="input-group">
+                  <label for="ai-dim-h">높이 (H)</label>
+                  <input type="number" id="ai-dim-h" value="750" min="200" max="3000" step="50" />
+                </div>
+              </div>
+            </div>
+
+            <!-- 4. 기본 형태(Shape) 특성 선택 -->
+            <div class="input-group" style="margin-top:10px;">
+              <label for="ai-furn-shape">5. 기본 형태 (Shape) 특성</label>
+              <select id="ai-furn-shape">
+                <option value="legged" selected>다리가 있는 형태 (4-Legged / Frame Support)</option>
+                <option value="box">직육면체 프레임형 (Box / Monolith Cabinet)</option>
+                <option value="cylinder">원기둥 / 곡선형 (Cylindrical / Rounded)</option>
+                <option value="lshape">L자형 / 코너형 (L-Shape Corner Layout)</option>
+              </select>
+            </div>
+
+            <!-- 5. 기본 베이스 컬러 (이미지 없을 때 또는 보정용) -->
+            <div class="input-group" style="margin-top:10px;">
+              <label for="ai-fallback-color">6. 표면 컬러 (이미지 업로드 시 자동 덮어씀)</label>
+              <div class="color-picker-row">
+                <input type="color" id="ai-fallback-color" value="#A47D55" />
+                <span id="ai-fallback-color-label">#A47D55</span>
+              </div>
+            </div>
+
+            <!-- 생성 실행 버튼 -->
+            <button id="btn-generate-ai-furniture" class="primary-btn full-width" style="margin-top:14px; padding:11px;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+              </svg>
+              AI 3D 모델 생성 및 배치하기
+            </button>
+
+            <!-- AI 로딩 프로그레스 영역 -->
+            <div id="ai-loading-box" class="ai-loading-box hidden">
+              <div class="ai-loading-text">
+                AI가 이미지 텍스처와 규격 데이터를 분석하여 3D 메쉬를 생성 중입니다...
+              </div>
+              <div class="progress-track">
+                <div id="ai-progress-bar" class="progress-fill"></div>
+              </div>
+              <div id="ai-loading-step" class="ai-loading-step">Canvas 픽셀 샘플링 및 절차적 지오메트리 합성 중</div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ==================== 중앙 메인 뷰포트 영역 ==================== -->
+      <main id="center-viewport">
+        <!-- 3D WebGL 시뮬레이션 캔버스 컨테이너 -->
+        <div id="viewport-3d" class="viewport-layer active">
+          <canvas id="three-canvas"></canvas>
+
+          <!-- 좌측 상단 공간/충돌 상태 HUD -->
+          <div class="viewport-hud-top-left">
+            <div class="hud-pill" id="hud-room-info">
+              <span class="hud-dot"></span>
+              <span id="hud-room-text">원룸 오픈형 (3500 × 4500 mm)</span>
+            </div>
+            <div class="hud-pill status-ok" id="hud-collision-banner">
+              <span class="hud-dot"></span>
+              <span id="hud-collision-text">충돌 없음 · 동선 안전</span>
+            </div>
+          </div>
+
+          <!-- 하단 조작 가이드 바 -->
+          <div class="viewport-hud-bottom">
+            <span><strong>마우스 좌클릭 드래그(가구):</strong> 바닥면 이동</span>
+            <span class="hud-sep">|</span>
+            <span><strong>마우스 좌클릭(빈 공간):</strong> 카메라 회전</span>
+            <span class="hud-sep">|</span>
+            <span><strong>우클릭 드래그:</strong> 화면 패닝</span>
+            <span class="hud-sep">|</span>
+            <span><strong>휠:</strong> 줌 인/아웃</span>
+            <span class="hud-sep">|</span>
+            <span><strong>단축키 R / Delete:</strong> 90° 회전 / 삭제</span>
+          </div>
+        </div>
+
+        <!-- 2D 단면도 드로잉 캔버스 컨테이너 -->
+        <div id="viewport-2d" class="viewport-layer">
+          <canvas id="floorplan-canvas"></canvas>
+
+          <!-- 2D 모드 상단 플로팅 툴바 -->
+          <div class="hud-2d-toolbar">
+            <span class="hud-2d-label">2D CAD Floorplan Editor (1격자 = 500mm / 스냅 = 100mm)</span>
+            <div class="hud-2d-tools">
+              <button class="hud-tool-chip active" data-tool="select">선택/이동</button>
+              <button class="hud-tool-chip" data-tool="wall">+ 벽체 그리기</button>
+              <button class="hud-tool-chip" data-tool="door">+ 방문(900mm 반경)</button>
+              <button class="hud-tool-chip" data-tool="window">+ 창문</button>
+              <button class="hud-tool-chip" data-tool="erase">삭제</button>
+              <button id="btn-2d-to-3d-extrude" class="primary-btn mini">3D 실시간 변환 (Extrude) →</button>
+            </div>
+          </div>
+
+          <div class="viewport-hud-bottom">
+            <span><strong>벽 그리기 모드:</strong> 시작점 클릭 후 드래그하여 놓으면 벽체 생성</span>
+            <span class="hud-sep">|</span>
+            <span><strong>문/창문 모드:</strong> 기존 벽 선분 위를 클릭하여 배치</span>
+            <span class="hud-sep">|</span>
+            <span><strong>가구 이동:</strong> [선택/이동] 도구에서 가구 박스를 드래그</span>
+          </div>
+        </div>
+
+        <!-- 토스트 알림 -->
+        <div id="toast-notification" class="toast hidden"></div>
+      </main>
+
+      <!-- ==================== 우측 사이드바 (속성 제어창) ==================== -->
+      <aside id="right-sidebar">
+        <div class="right-panel-header">
+          <h2>상세 속성 제어창</h2>
+          <span id="inspector-target-badge" class="inspector-badge">공간 설정</span>
+        </div>
+
+        <!-- 가구 미선택 시: 방/환경 및 동선 전체 요약 -->
+        <div id="inspector-empty-state" class="inspector-content">
+          <div class="info-card">
+            <h4>선택된 가구가 없습니다</h4>
+            <p>3D 뷰포트 또는 2D 도면에서 가구를 클릭하면 위치(X/Y/Z), 회전 각도, 가로/세로/높이 치수, 색상 및 동선 반경을 정밀 제어할 수 있습니다.</p>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>인간공학 동선 &amp; 시뮬레이션 옵션</h3>
+            </div>
+            <label class="checkbox-row">
+              <input type="checkbox" id="chk-global-ergo" checked />
+              <div>
+                <strong>생활과학 동선 반경 표시</strong>
+                <small>가구별 최소 활동 여유 공간 및 방문 개폐 반경(900mm) 표시</small>
+              </div>
+            </label>
+            <label class="checkbox-row">
+              <input type="checkbox" id="chk-snap-grid" checked />
+              <div>
+                <strong>바닥 그리드 스냅 (50mm 단위)</strong>
+                <small>가구 이동 시 정밀한 벽 밀착 및 정렬 지원</small>
+              </div>
+            </label>
+          </div>
+
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>현재 배치된 가구 목록 (<span id="placed-count">0</span>)</h3>
+            </div>
+            <div id="placed-furniture-list" class="placed-list">
+              <!-- 동적 렌더링 -->
+            </div>
+          </div>
+        </div>
+
+        <!-- 가구 선택 시: 상세 속성 편집기 -->
+        <div id="inspector-furniture-state" class="inspector-content hidden">
+          <!-- 선택된 가구 헤더 -->
+          <div class="selected-item-card">
+            <div>
+              <span id="prop-item-category" class="item-cat-tag">CATEGORY</span>
+              <h3 id="prop-item-name">가구 이름</h3>
+            </div>
+            <div id="prop-collision-badge" class="collision-tag safe">정상 배치</div>
+          </div>
+
+          <!-- 충돌 경고 상세 안내 박스 -->
+          <div id="prop-collision-detail" class="collision-alert-box hidden">
+            <strong>충돌 / 동선 침범 감지됨 (#EF4444)</strong>
+            <p id="prop-collision-reason">벽체 또는 방문 개폐 반경(900mm)과 겹쳐 있습니다.</p>
+          </div>
+
+          <!-- 위치 X / Y / Z 좌표 조절 (mm) -->
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>위치 좌표 (Position, mm)</h3>
+              <span class="section-sub">방 중심 (0, 0, 0) 기준</span>
+            </div>
+            <div class="form-row-3">
+              <div class="input-group">
+                <label for="prop-pos-x">X (좌우)</label>
+                <input type="number" id="prop-pos-x" step="50" />
+              </div>
+              <div class="input-group">
+                <label for="prop-pos-y">Y (바닥높이)</label>
+                <input type="number" id="prop-pos-y" step="50" min="0" max="2500" />
+              </div>
+              <div class="input-group">
+                <label for="prop-pos-z">Z (앞뒤)</label>
+                <input type="number" id="prop-pos-z" step="50" />
+              </div>
+            </div>
+          </div>
+
+          <!-- 회전 조절 (90도 버튼 + 0~360 미세 슬라이더) -->
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>회전 각도 (Rotation Y)</h3>
+              <span id="prop-rot-value" class="mono-val">0°</span>
+            </div>
+            <input type="range" id="prop-rot-slider" min="0" max="360" step="1" value="0" class="range-slider" />
+            <div class="btn-row-4" style="margin-top:8px;">
+              <button class="secondary-btn rot-quick-btn" data-rot-delta="-90">-90°</button>
+              <button class="secondary-btn rot-quick-btn" data-rot-delta="90">+90° 회전</button>
+              <button class="secondary-btn rot-set-btn" data-rot-set="0">0°</button>
+              <button class="secondary-btn rot-set-btn" data-rot-set="180">180°</button>
+            </div>
+          </div>
+
+          <!-- 가로 / 세로 / 높이 치수 변경 (mm) -->
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>치수 변경 (Dimensions, mm)</h3>
+              <span class="section-sub">실시간 3D 스케일 및 충돌 박스 갱신</span>
+            </div>
+            <div class="form-row-3">
+              <div class="input-group">
+                <label for="prop-dim-w">가로 (W)</label>
+                <input type="number" id="prop-dim-w" step="50" min="150" max="5000" />
+              </div>
+              <div class="input-group">
+                <label for="prop-dim-d">깊이 (D)</label>
+                <input type="number" id="prop-dim-d" step="50" min="150" max="5000" />
+              </div>
+              <div class="input-group">
+                <label for="prop-dim-h">높이 (H)</label>
+                <input type="number" id="prop-dim-h" step="50" min="150" max="3500" />
+              </div>
+            </div>
+            <button id="btn-apply-prop-dim" class="secondary-btn full-width" style="margin-top:8px;">치수 변경 적용</button>
+          </div>
+
+          <!-- 표면 색상 & 동선 반경 토글 -->
+          <div class="panel-section">
+            <div class="section-header">
+              <h3>재질 색상 &amp; 인간공학 동선 반경</h3>
+            </div>
+            <div class="color-picker-row" style="margin-bottom:10px;">
+              <label for="prop-color-picker" style="margin:0; flex:1;">주요 표면 색상</label>
+              <input type="color" id="prop-color-picker" value="#6B7280" />
+              <span id="prop-color-hex" class="mono-val">#6B7280</span>
+            </div>
+            <label class="checkbox-row">
+              <input type="checkbox" id="prop-ergo-toggle" checked />
+              <div>
+                <strong>인간공학적 동선 반경 표시</strong>
+                <small id="prop-ergo-desc">의자 인출 및 통행 여유 반경 표시</small>
+              </div>
+            </label>
+          </div>
+
+          <!-- 액션 버튼 (복제 / 선택 해제 / 삭제) -->
+          <div class="panel-section">
+            <div class="btn-row-2">
+              <button id="btn-duplicate-item" class="secondary-btn">가구 복제</button>
+              <button id="btn-deselect-item" class="secondary-btn">선택 해제</button>
+            </div>
+            <button id="btn-delete-item" class="danger-btn full-width" style="margin-top:8px;">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14H7L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>
+              </svg>
+              선택한 가구 삭제 (Delete)
+            </button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
