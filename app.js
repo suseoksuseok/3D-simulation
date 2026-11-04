@@ -1,10 +1,18 @@
 /**
- * SpaceCraft 3D — 웹 기반 3D 인테리어 및 공간 시뮬레이션 플랫폼
+ * SpaceCraft 3D — AI Blueprint & 3D 공간 시뮬레이션 플랫폼
  * Scale: 1000mm = 1.0 unit (Three.js meter scale)
- * Features:
- * 1. 2D Floorplan Editor (Presets + Custom Wall/Door/Window Drawing) -> Real-time 3D Extrusion
- * 2. 3D Furniture Catalog, Raycaster Drag & Drop, AABB Collision & Ergonomic Door Swing (900mm) Check
- * 3. AI Custom 3D Furniture Generator (Canvas Dominant Color + CanvasTexture + Procedural 3D Mesh Synthesis)
+ *
+ * All Bugs Fixed & Enhanced Version:
+ * 1. Safe JSON extraction from LLM conversational text using robust regex pattern matching
+ * 2. Accurate point-to-segment distance for 2D Wall Erase Tool (erases on click anywhere along wall)
+ * 3. Complete floor polygon reset on 2D clear walls and dynamic boundary computation
+ * 4. High-performance non-destructive color changes (direct material color update without geometry destruction)
+ * 5. Full GLB 3D model preservation (cloning from memory for vault re-placement and smooth scale updates)
+ * 6. Smooth 2D canvas Panning (Right-Click Drag or Middle-Click Drag) and pointer capture
+ * 7. Persistent placed furniture list in inspector for instant one-click switching
+ * 8. Safe door/window placement margin checks to prevent corrupted segmented wall geometry
+ * 9. Escape key shortcut for deselection and drawing cancellation
+ * 10. Robust Ollama API response compatibility (checks both data.response and data.message.content)
  */
 
 (function () {
@@ -12,13 +20,15 @@
 
   const MM_TO_UNIT = 0.001; // 1000mm = 1 unit
   const UNIT_TO_MM = 1000;
-  const STORAGE_KEY = 'SPACECRAFT_3D_INTERIOR_STATE_V1';
+  const STORAGE_KEY_STATE = 'SPACECRAFT_3D_INTERIOR_STATE_V2';
+  const STORAGE_KEY_AI_CONFIG = 'SPACECRAFT_3D_AI_CONFIG_V2';
 
   // ==================== APPLICATION STATE ====================
   const state = {
     mode: '3d', // '2d' | '3d'
+    deviceMode: 'pc', // 'pc' | 'mobile'
     activePreset: 'studio',
-    roomName: '원룸 오픈형 (3500 × 4500 mm)',
+    roomName: '① 원룸 오픈형 (3500 × 4500 mm)',
     ceilingHeight: 2400, // mm
     wallThickness: 160,  // mm
     autoCutaway: true,
@@ -26,20 +36,33 @@
     snapToGrid: true,
 
     // 2D Floorplan Data (in mm, centered around 0,0)
-    // floorPolygons: array of points [{x, z}, ...] in mm
     floorPolygon: [],
-    // walls: [{ id, x1, z1, x2, z2, thickness, height, isInterior }]
     walls: [],
-    // openings: [{ id, wallId, type: 'door'|'window', t: 0..1, width: 900, height: 2100, sill: 0, swingDir: 1 }]
     openings: [],
 
     // Furniture Instances
-    // [{ id, catalogId, name, category, shape, w, d, h, x, y, z, rotY, color, textureDataUrl, ergoVisible, isAI }]
     furnitureList: [],
     selectedFurnitureId: null,
 
-    // Saved AI Custom Furniture Catalog Vault
+    // Saved AI Custom Furniture & GLB Catalog Vault
     aiVault: [],
+
+    // Memory Store for Loaded GLB Models (id -> THREE.Group or Scene)
+    glbModelCache: new Map(),
+
+    // AI Engine Configuration
+    aiConfig: {
+      provider: 'gemini', // 'gemini' | 'openai' | 'ollama' | 'smart_preset'
+      geminiApiKey: '',
+      openaiApiKey: '',
+      ollamaUrl: 'http://localhost:11434/api/generate',
+      ollamaModel: 'llama3.2-vision'
+    },
+
+    // AI Upload Temp State
+    aiUploadedBase64: null,
+    aiUploadedMimeType: 'image/jpeg',
+    aiExtractedHex: '#C89D7C',
 
     // 2D Editor Interaction State
     drawTool: 'select', // 'select' | 'wall' | 'door' | 'window' | 'erase'
@@ -48,13 +71,285 @@
     drawCurrentPt: null,
     dragging2DFurnitureId: null,
     drag2DOffset: { x: 0, z: 0 },
-    pan2D: { x: 0, y: 0 },
-    zoom2D: 0.11, // px per mm
 
-    // AI Upload Temp State
-    aiUploadedImageDataUrl: null,
-    aiExtractedHex: '#A47D55'
+    // Selection & 2D Wall/Vertex Manipulation Extensions
+    selectedWallId: null,
+    hoveredWallId: null,
+    hoveredVertex: null,
+    drag2DMode: null, // 'pan' | 'wall' | 'vertex' | 'furniture' | null
+    draggingWall: null,
+    draggingVertex: null,
+    hasDragged2D: false,
+    orthoGuideLine: null,
+
+    // 2D Canvas Panning & Zooming
+    isPanning2D: false,
+    panStart2D: { x: 0, y: 0 },
+    pan2D: { x: 0, y: 0 },
+    zoom2D: 0.11 // px per mm
   };
+
+  // ==================== UNDO / REDO HISTORY SYSTEM ====================
+  const HistoryManager = {
+    undoStack: [],
+    redoStack: [],
+    maxSteps: 50,
+    isApplying: false,
+
+    takeSnapshot() {
+      return {
+        walls: JSON.parse(JSON.stringify(state.walls || [])),
+        openings: JSON.parse(JSON.stringify(state.openings || [])),
+        floorPolygon: JSON.parse(JSON.stringify(state.floorPolygon || [])),
+        furnitureList: JSON.parse(JSON.stringify(state.furnitureList || [])),
+        roomName: state.roomName,
+        activePreset: state.activePreset,
+        ceilingHeight: state.ceilingHeight,
+        wallThickness: state.wallThickness
+      };
+    },
+
+    pushState() {
+      if (this.isApplying) return;
+      const snap = this.takeSnapshot();
+
+      // Avoid redundant identical snapshots
+      if (this.undoStack.length > 0) {
+        const last = this.undoStack[this.undoStack.length - 1];
+        if (JSON.stringify(last) === JSON.stringify(snap)) {
+          return;
+        }
+      }
+
+      this.undoStack.push(snap);
+      if (this.undoStack.length > this.maxSteps) {
+        this.undoStack.shift();
+      }
+      this.redoStack = [];
+      this.updateButtonsUI();
+    },
+
+    applySnapshot(snap) {
+      if (!snap) return;
+      this.isApplying = true;
+
+      state.walls = JSON.parse(JSON.stringify(snap.walls || []));
+      state.openings = JSON.parse(JSON.stringify(snap.openings || []));
+      state.floorPolygon = JSON.parse(JSON.stringify(snap.floorPolygon || []));
+      state.furnitureList = JSON.parse(JSON.stringify(snap.furnitureList || []));
+      if (snap.roomName) state.roomName = snap.roomName;
+      if (snap.activePreset) state.activePreset = snap.activePreset;
+      if (snap.ceilingHeight) state.ceilingHeight = snap.ceilingHeight;
+      if (snap.wallThickness) state.wallThickness = snap.wallThickness;
+
+      if (state.selectedFurnitureId && !state.furnitureList.some((f) => f.id === state.selectedFurnitureId)) {
+        state.selectedFurnitureId = null;
+      }
+      if (state.selectedWallId && !state.walls.some((w) => w.id === state.selectedWallId)) {
+        state.selectedWallId = null;
+      }
+
+      rebuild3DRoomGeometry();
+      syncAllFurnitureMeshesFromState();
+      evaluateAllCollisions();
+
+      updateInspectorUI();
+      draw2DFloorplan();
+
+      this.isApplying = false;
+      this.updateButtonsUI();
+    },
+
+    undo() {
+      if (this.undoStack.length <= 1) {
+        showToast('더 이상 되돌릴 이전 내역이 없습니다.');
+        return;
+      }
+      const current = this.undoStack.pop();
+      this.redoStack.push(current);
+
+      const prev = this.undoStack[this.undoStack.length - 1];
+      this.applySnapshot(prev);
+      showToast('실행 취소(Undo)되었습니다.');
+    },
+
+    redo() {
+      if (this.redoStack.length === 0) {
+        showToast('복구할(Redo) 다음 내역이 없습니다.');
+        return;
+      }
+      const next = this.redoStack.pop();
+      this.undoStack.push(next);
+      this.applySnapshot(next);
+      showToast('다시 실행(Redo)되었습니다.');
+    },
+
+    updateButtonsUI() {
+      const btnUndo = document.getElementById('btn-undo');
+      const btnRedo = document.getElementById('btn-redo');
+      const canUndo = this.undoStack.length > 1;
+      const canRedo = this.redoStack.length > 0;
+      if (btnUndo) {
+        btnUndo.disabled = !canUndo;
+        btnUndo.classList.toggle('disabled', !canUndo);
+      }
+      if (btnRedo) {
+        btnRedo.disabled = !canRedo;
+        btnRedo.classList.toggle('disabled', !canRedo);
+      }
+    }
+  };
+
+  function syncAllFurnitureMeshesFromState() {
+    const activeIds = new Set(state.furnitureList.map((f) => f.id));
+
+    // Remove obsolete meshes
+    for (const [id, mesh] of furnitureMeshMap.entries()) {
+      if (!activeIds.has(id)) {
+        furnitureGroup.remove(mesh);
+        furnitureMeshMap.delete(id);
+      }
+    }
+
+    // Add or update meshes
+    state.furnitureList.forEach((item) => {
+      let meshGroup = furnitureMeshMap.get(item.id);
+      if (!meshGroup) {
+        if (item.isGLB) {
+          const cachedScene = state.glbModelCache.get(item.catalogId) || state.glbModelCache.get(item.id);
+          if (cachedScene) {
+            meshGroup = buildGLBFurnitureGroup(cachedScene, item);
+          } else {
+            const bp = item.blueprintData || generateSmartBlueprint('modern_rect_desk', item.w, item.d, item.h, item.color, 'wood');
+            meshGroup = buildFurnitureFromAIJson(bp, item);
+          }
+        } else {
+          const bp = item.blueprintData || generateSmartBlueprint(item.shape, item.w, item.d, item.h, item.color, item.materialType);
+          meshGroup = buildFurnitureFromAIJson(bp, item);
+        }
+        furnitureGroup.add(meshGroup);
+        furnitureMeshMap.set(item.id, meshGroup);
+      } else {
+        meshGroup.position.set(item.x * MM_TO_UNIT, (item.y || 0) * MM_TO_UNIT, item.z * MM_TO_UNIT);
+        meshGroup.rotation.y = THREE.MathUtils.degToRad(-item.rotY);
+        updateFurnitureMaterialColor(item, item.color || '#4B5563');
+      }
+    });
+  }
+
+  function selectWall(id) {
+    state.selectedWallId = id;
+    if (id) {
+      state.selectedFurnitureId = null;
+      state.furnitureList.forEach((item) => updateFurnitureVisualStatus(item));
+      if (state.deviceMode === 'mobile') {
+        openMobileDrawer('right');
+      }
+    }
+    updateInspectorUI();
+    draw2DFloorplan();
+  }
+
+  function deleteSelectedWall() {
+    if (!state.selectedWallId) return;
+    const wallId = state.selectedWallId;
+    const idx = state.walls.findIndex((w) => w.id === wallId);
+    if (idx !== -1) {
+      state.walls.splice(idx, 1);
+      state.openings = state.openings.filter((o) => o.wallId !== wallId);
+      state.selectedWallId = null;
+      rebuild3DRoomGeometry();
+      evaluateAllCollisions();
+      updateInspectorUI();
+      draw2DFloorplan();
+      HistoryManager.pushState();
+      showToast('선택한 벽체와 부착된 문/창문이 삭제되었습니다.');
+    }
+  }
+
+  function applySelectedWallLength(newLenMM) {
+    if (!state.selectedWallId) return;
+    const wall = state.walls.find((w) => w.id === state.selectedWallId);
+    if (!wall) return;
+    newLenMM = Math.max(300, Math.min(25000, Number(newLenMM) || 1000));
+    const curLen = Math.hypot(wall.x2 - wall.x1, wall.z2 - wall.z1);
+    if (curLen < 1) return;
+    const ux = (wall.x2 - wall.x1) / curLen;
+    const uz = (wall.z2 - wall.z1) / curLen;
+    wall.x2 = Math.round(wall.x1 + ux * newLenMM);
+    wall.z2 = Math.round(wall.z1 + uz * newLenMM);
+    rebuild3DRoomGeometry();
+    evaluateAllCollisions();
+    updateInspectorUI();
+    draw2DFloorplan();
+    HistoryManager.pushState();
+    showToast(`벽체 길이가 ${newLenMM}mm 로 변경되었습니다.`);
+  }
+
+  function getConnectedWallEndpoints(vx, vz, toleranceMM = 70) {
+    const connections = [];
+    state.walls.forEach((w) => {
+      if (Math.hypot(w.x1 - vx, w.z1 - vz) <= toleranceMM) {
+        connections.push({ wall: w, endpoint: 'start', origX: w.x1, origZ: w.z1 });
+      }
+      if (Math.hypot(w.x2 - vx, w.z2 - vz) <= toleranceMM) {
+        connections.push({ wall: w, endpoint: 'end', origX: w.x2, origZ: w.z2 });
+      }
+    });
+    return connections;
+  }
+
+  function findVertexNearCanvasPoint(px, py, hitRadiusPx = 14) {
+    let best = null;
+    let bestDist = hitRadiusPx;
+
+    state.walls.forEach((wall) => {
+      const p1 = mmToCanvas2D(wall.x1, wall.z1);
+      const d1 = Math.hypot(px - p1.px, py - p1.py);
+      if (d1 < bestDist) {
+        bestDist = d1;
+        best = {
+          wallId: wall.id,
+          endpoint: 'start',
+          x: wall.x1,
+          z: wall.z1,
+          px: p1.px,
+          py: p1.py
+        };
+      }
+
+      const p2 = mmToCanvas2D(wall.x2, wall.z2);
+      const d2 = Math.hypot(px - p2.px, py - p2.py);
+      if (d2 < bestDist) {
+        bestDist = d2;
+        best = {
+          wallId: wall.id,
+          endpoint: 'end',
+          x: wall.x2,
+          z: wall.z2,
+          px: p2.px,
+          py: p2.py
+        };
+      }
+    });
+
+    return best;
+  }
+
+  function findWallNearPoint(ptMM, maxDistMM = 220) {
+    let bestWall = null;
+    let bestDist = maxDistMM;
+
+    state.walls.forEach((wall) => {
+      const d = distToSegment(ptMM.x, ptMM.z, wall.x1, wall.z1, wall.x2, wall.z2);
+      if (d < bestDist) {
+        bestDist = d;
+        bestWall = wall;
+      }
+    });
+
+    return bestWall;
+  }
 
   // ==================== DEFAULT FURNITURE CATALOG ====================
   const DEFAULT_CATALOG = [
@@ -62,9 +357,10 @@
       catalogId: 'bed_single',
       name: '모던 싱글 침대',
       category: 'bed',
-      shape: 'legged',
+      shape: 'bed_frame_headboard',
       w: 1050, d: 2080, h: 850,
       color: '#4B5563',
+      materialType: 'fabric',
       tag: '침실',
       ergoClearance: { front: 500, side: 450 }
     },
@@ -72,9 +368,10 @@
       catalogId: 'bed_queen',
       name: '호텔형 퀸 침대',
       category: 'bed',
-      shape: 'legged',
+      shape: 'bed_frame_headboard',
       w: 1580, d: 2120, h: 920,
       color: '#57534E',
+      materialType: 'fabric',
       tag: '침실',
       ergoClearance: { front: 550, side: 500 }
     },
@@ -82,9 +379,10 @@
       catalogId: 'desk_work',
       name: '데스크테리어 모션 데스크',
       category: 'desk',
-      shape: 'legged',
+      shape: 'modern_rect_desk',
       w: 1400, d: 700, h: 740,
       color: '#8D6E63',
+      materialType: 'wood',
       tag: '서재/데스크',
       ergoClearance: { front: 750, side: 100 }
     },
@@ -92,9 +390,10 @@
       catalogId: 'chair_office',
       name: '에르고 메쉬 오피스 체어',
       category: 'chair',
-      shape: 'cylinder',
+      shape: 'office_swivel_chair',
       w: 620, d: 620, h: 980,
       color: '#374151',
+      materialType: 'metal',
       tag: '서재/데스크',
       ergoClearance: { front: 450, side: 350 }
     },
@@ -105,6 +404,7 @@
       shape: 'box',
       w: 1000, d: 600, h: 2100,
       color: '#D6D3D1',
+      materialType: 'wood',
       tag: '수납',
       ergoClearance: { front: 650, side: 50 }
     },
@@ -112,9 +412,10 @@
       catalogId: 'sofa_3seat',
       name: '노르딕 3인용 패브릭 소파',
       category: 'chair',
-      shape: 'legged',
+      shape: 'cushion_sofa_armchair',
       w: 2050, d: 880, h: 800,
       color: '#64748B',
+      materialType: 'fabric',
       tag: '거실',
       ergoClearance: { front: 600, side: 200 }
     },
@@ -122,9 +423,10 @@
       catalogId: 'bookshelf_5tier',
       name: '오픈형 5단 와이드 책장',
       category: 'wardrobe',
-      shape: 'box',
+      shape: 'open_shelf_bookcase',
       w: 900, d: 340, h: 1850,
       color: '#785A46',
+      materialType: 'wood',
       tag: '수납',
       ergoClearance: { front: 500, side: 50 }
     },
@@ -135,6 +437,7 @@
       shape: 'cylinder',
       w: 420, d: 420, h: 1620,
       color: '#F59E0B',
+      materialType: 'metal',
       tag: '조명/소품',
       ergoClearance: { front: 250, side: 250 }
     }
@@ -155,21 +458,163 @@
   // Door swing zones in world coordinates for collision check
   const doorSwingZones = [];
 
+  // Material and Texture Caches
+  const textureCache = new Map();
+
   // 2D Canvas Context
   let canvas2D, ctx2D;
 
+  // ==================== DEVICE MODE (PC vs MOBILE) & DRAWER CONTROLS ====================
+  function initDeviceMode() {
+    let savedMode = null;
+    try {
+      savedMode = localStorage.getItem('SPACECRAFT_DEVICE_MODE');
+    } catch (e) {}
+
+    if (savedMode === 'pc' || savedMode === 'mobile') {
+      setDeviceMode(savedMode, false);
+    } else {
+      const isSmallScreen = window.innerWidth <= 860;
+      const isTouchDev = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+      setDeviceMode((isSmallScreen || (isTouchDev && window.innerWidth <= 1024)) ? 'mobile' : 'pc', false);
+    }
+  }
+
+  function setDeviceMode(mode, save = true) {
+    state.deviceMode = mode;
+    const appContainer = document.getElementById('app-container');
+    if (appContainer) {
+      appContainer.classList.toggle('device-mode-mobile', mode === 'mobile');
+      appContainer.classList.toggle('device-mode-pc', mode === 'pc');
+    }
+
+    const toggleBtn = document.getElementById('btn-toggle-device-mode');
+    if (toggleBtn) {
+      toggleBtn.classList.toggle('is-mobile', mode === 'mobile');
+      toggleBtn.title = mode === 'mobile' ? '현재: 모바일 모드 (클릭하여 PC 모드로 전환)' : '현재: PC 모드 (클릭하여 모바일 모드로 전환)';
+    }
+
+    if (mode === 'pc') {
+      closeMobileDrawers();
+    }
+
+    if (save) {
+      try {
+        localStorage.setItem('SPACECRAFT_DEVICE_MODE', mode);
+      } catch (e) {}
+    }
+
+    onWindowResize();
+    draw2DFloorplan();
+  }
+
+  function openMobileDrawer(drawerName) {
+    const leftSidebar = document.getElementById('left-sidebar');
+    const rightSidebar = document.getElementById('right-sidebar');
+    const backdrop = document.getElementById('mobile-drawer-backdrop');
+
+    if (drawerName === 'left') {
+      if (leftSidebar) leftSidebar.classList.add('mobile-open');
+      if (rightSidebar) rightSidebar.classList.remove('mobile-open');
+      if (backdrop) backdrop.classList.remove('hidden');
+    } else if (drawerName === 'right') {
+      if (rightSidebar) rightSidebar.classList.add('mobile-open');
+      if (leftSidebar) leftSidebar.classList.remove('mobile-open');
+      if (backdrop) backdrop.classList.remove('hidden');
+    }
+  }
+
+  function closeMobileDrawers() {
+    const leftSidebar = document.getElementById('left-sidebar');
+    const rightSidebar = document.getElementById('right-sidebar');
+    const backdrop = document.getElementById('mobile-drawer-backdrop');
+
+    if (leftSidebar) leftSidebar.classList.remove('mobile-open');
+    if (rightSidebar) rightSidebar.classList.remove('mobile-open');
+    if (backdrop) backdrop.classList.add('hidden');
+  }
+
   // ==================== INITIALIZATION ====================
   window.addEventListener('DOMContentLoaded', () => {
+    initDeviceMode();
+    loadSavedAIConfig();
     initThreeScene();
     init2DCanvas();
     renderCatalogUI();
+    renderAIVaultUI();
     bindUIEvents();
 
     // Load default preset (① 원룸 오픈형 3500x4500mm) with starter furniture
     loadFloorplanPreset('studio', true);
 
+    // Initial clean baseline snapshot for HistoryManager
+    HistoryManager.undoStack = [ HistoryManager.takeSnapshot() ];
+    HistoryManager.redoStack = [];
+    HistoryManager.updateButtonsUI();
+
     animate();
   });
+
+  // ==================== AI CONFIG STORAGE ====================
+  function loadSavedAIConfig() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_AI_CONFIG);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        state.aiConfig = { ...state.aiConfig, ...saved };
+      }
+    } catch (e) {
+      console.warn('Failed to load AI config from localStorage', e);
+    }
+    syncAIConfigUI();
+  }
+
+  function saveAIConfig() {
+    try {
+      localStorage.setItem(STORAGE_KEY_AI_CONFIG, JSON.stringify(state.aiConfig));
+    } catch (e) {
+      console.warn('Failed to save AI config to localStorage', e);
+    }
+  }
+
+  function syncAIConfigUI() {
+    const provSelect = document.getElementById('ai-provider-select');
+    if (provSelect) provSelect.value = state.aiConfig.provider;
+
+    const cloudKeyWrap = document.getElementById('ai-cloud-key-wrap');
+    const ollamaWrap = document.getElementById('ai-ollama-config-wrap');
+    const keyInput = document.getElementById('ai-api-key-input');
+    const labelKey = document.getElementById('ai-key-provider-label');
+    const statusPill = document.getElementById('ai-engine-status-pill');
+
+    const provider = state.aiConfig.provider;
+
+    if (provider === 'gemini') {
+      cloudKeyWrap.classList.remove('hidden');
+      ollamaWrap.classList.add('hidden');
+      labelKey.textContent = 'Gemini';
+      keyInput.placeholder = 'AIzaSy... (Google AI Studio Key)';
+      keyInput.value = state.aiConfig.geminiApiKey || '';
+      statusPill.textContent = 'Gemini 2.5 Flash';
+    } else if (provider === 'openai') {
+      cloudKeyWrap.classList.remove('hidden');
+      ollamaWrap.classList.add('hidden');
+      labelKey.textContent = 'OpenAI';
+      keyInput.placeholder = 'sk-... (OpenAI API Key)';
+      keyInput.value = state.aiConfig.openaiApiKey || '';
+      statusPill.textContent = 'GPT-4o-mini';
+    } else if (provider === 'ollama') {
+      cloudKeyWrap.classList.add('hidden');
+      ollamaWrap.classList.remove('hidden');
+      document.getElementById('ai-ollama-url').value = state.aiConfig.ollamaUrl || 'http://localhost:11434/api/generate';
+      document.getElementById('ai-ollama-model').value = state.aiConfig.ollamaModel || 'llama3.2-vision';
+      statusPill.textContent = `Ollama: ${state.aiConfig.ollamaModel || 'vision'}`;
+    } else {
+      cloudKeyWrap.classList.add('hidden');
+      ollamaWrap.classList.add('hidden');
+      statusPill.textContent = '스마트 파라미터 프리셋';
+    }
+  }
 
   // ==================== THREE.JS SETUP ====================
   function initThreeScene() {
@@ -201,37 +646,40 @@
     controls = new THREE.OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.07;
-    controls.maxPolarAngle = Math.PI / 2 - 0.02; // Prevent going below floor
+    controls.maxPolarAngle = Math.PI / 2 - 0.02;
     controls.minDistance = 1.5;
-    controls.maxDistance = 22;
+    controls.maxDistance = 24;
     controls.target.set(0, 0.6, 0);
+    controls.touches = {
+      ONE: THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN
+    };
+    window.controls = controls;
 
-    // Subtle dark GridHelper (#2A2C32)
-    const gridHelper = new THREE.GridHelper(16, 32, 0x383B46, 0x2A2C32);
+    const gridHelper = new THREE.GridHelper(18, 36, 0x383B46, 0x2A2C32);
     gridHelper.position.y = -0.002;
     scene.add(gridHelper);
 
-    // Lighting Setup (Architectural Studio Lighting)
-    const ambientLight = new THREE.AmbientLight(0xDCE3F2, 0.62);
+    const ambientLight = new THREE.AmbientLight(0xDCE3F2, 0.65);
     scene.add(ambientLight);
 
-    const hemiLight = new THREE.HemisphereLight(0xE2E8F0, 0x1E1F24, 0.35);
+    const hemiLight = new THREE.HemisphereLight(0xE2E8F0, 0x1E1F24, 0.4);
     hemiLight.position.set(0, 8, 0);
     scene.add(hemiLight);
 
-    const dirLight = new THREE.DirectionalLight(0xFFFBEB, 0.78);
-    dirLight.position.set(5.5, 9.5, 6.5);
+    const dirLight = new THREE.DirectionalLight(0xFFFBEB, 0.85);
+    dirLight.position.set(6.0, 9.5, 7.0);
     dirLight.castShadow = true;
     dirLight.shadow.mapSize.width = 2048;
     dirLight.shadow.mapSize.height = 2048;
     dirLight.shadow.camera.near = 0.5;
-    dirLight.shadow.camera.far = 25;
-    const d = 7;
+    dirLight.shadow.camera.far = 28;
+    const d = 7.5;
     dirLight.shadow.camera.left = -d;
     dirLight.shadow.camera.right = d;
     dirLight.shadow.camera.top = d;
     dirLight.shadow.camera.bottom = -d;
-    dirLight.shadow.bias = -0.0005;
+    dirLight.shadow.bias = -0.0004;
     scene.add(dirLight);
 
     roomGroup = new THREE.Group();
@@ -241,11 +689,14 @@
     scene.add(furnitureGroup);
     scene.add(helperGroup);
 
+    window.roomGroup = roomGroup;
+    window.furnitureGroup = furnitureGroup;
+    window.scene = scene;
+
     raycaster = new THREE.Raycaster();
     mouseNDC = new THREE.Vector2();
     dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
-    // 3D Pointer Events for Raycaster Drag & Drop
     canvas.addEventListener('pointerdown', on3DPointerDown);
     canvas.addEventListener('pointermove', on3DPointerMove);
     window.addEventListener('pointerup', on3DPointerUp);
@@ -278,7 +729,115 @@
     }
   }
 
-  // ==================== [기능 1] 건물 3D 시뮬레이션 (프리셋 + 2D 편집 + 3D Extrusion) ====================
+  // ==================== PROCEDURAL MATERIALS ====================
+  function getProceduralTexture(type, baseHex) {
+    const key = `${type}_${baseHex}`;
+    if (textureCache.has(key)) return textureCache.get(key);
+
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+
+    if (type === 'wood') {
+      c.width = 256;
+      c.height = 256;
+      ctx.fillStyle = baseHex;
+      ctx.fillRect(0, 0, 256, 256);
+
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.12)';
+      ctx.lineWidth = 1.6;
+      for (let y = 4; y < 256; y += 8) {
+        ctx.beginPath();
+        for (let x = 0; x <= 256; x += 16) {
+          const wave = Math.sin(x * 0.05 + y * 0.02) * 3 + Math.sin(x * 0.12) * 1.5;
+          if (x === 0) ctx.moveTo(x, y + wave);
+          else ctx.lineTo(x, y + wave);
+        }
+        ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.lineWidth = 1.0;
+      for (let y = 8; y < 256; y += 16) {
+        ctx.beginPath();
+        for (let x = 0; x <= 256; x += 16) {
+          const wave = Math.sin(x * 0.05 + y * 0.02) * 3;
+          if (x === 0) ctx.moveTo(x, y + wave);
+          else ctx.lineTo(x, y + wave);
+        }
+        ctx.stroke();
+      }
+    } else if (type === 'fabric') {
+      c.width = 128;
+      c.height = 128;
+      ctx.fillStyle = baseHex;
+      ctx.fillRect(0, 0, 128, 128);
+
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.09)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < 128; i += 4) {
+        ctx.beginPath();
+        ctx.moveTo(i, 0); ctx.lineTo(i, 128);
+        ctx.moveTo(0, i); ctx.lineTo(128, i);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+      for (let i = 2; i < 128; i += 4) {
+        ctx.beginPath();
+        ctx.moveTo(i, 0); ctx.lineTo(i, 128);
+        ctx.stroke();
+      }
+    }
+
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(1.5, 1.5);
+    textureCache.set(key, tex);
+    return tex;
+  }
+
+  function createProceduralMaterial(matType, hexColor) {
+    const color = new THREE.Color(hexColor || '#8B6F4E');
+    const type = matType || 'wood';
+
+    if (type === 'metal') {
+      return new THREE.MeshStandardMaterial({
+        color,
+        metalness: 0.88,
+        roughness: 0.22
+      });
+    } else if (type === 'glass') {
+      return new THREE.MeshPhysicalMaterial({
+        color,
+        metalness: 0.1,
+        roughness: 0.08,
+        transparent: true,
+        opacity: 0.38,
+        transmission: 0.6
+      });
+    } else if (type === 'fabric') {
+      return new THREE.MeshStandardMaterial({
+        map: getProceduralTexture('fabric', hexColor || '#64748B'),
+        color,
+        roughness: 0.86,
+        metalness: 0.02
+      });
+    } else if (type === 'plastic') {
+      return new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.38,
+        metalness: 0.05
+      });
+    } else {
+      return new THREE.MeshStandardMaterial({
+        map: getProceduralTexture('wood', hexColor || '#8B6F4E'),
+        color,
+        roughness: 0.62,
+        metalness: 0.05
+      });
+    }
+  }
+
+  // ==================== [기능 1] 건물 3D 시뮬레이션 ====================
   function loadFloorplanPreset(presetKey, includeSampleFurniture = false) {
     state.activePreset = presetKey;
     state.walls = [];
@@ -288,12 +847,10 @@
     const h = state.ceilingHeight;
 
     if (presetKey === 'studio') {
-      // ① 원룸 오픈형 3500 x 4500 mm
       const W = 3500, D = 4500;
       state.roomName = '① 원룸 오픈형 (3500 × 4500 mm)';
       setRoomDimensionInputs(W, D, h);
       buildRectangularRoomWalls(W, D, t, h);
-      // 방문 (하단 벽 좌측) + 창문 (상단 벽 중앙)
       state.openings.push({
         id: 'open_door_1',
         wallId: 'wall_bottom',
@@ -314,12 +871,10 @@
         sill: 850
       });
     } else if (presetKey === 'onehalf') {
-      // ② 분리형 1.5룸 5200 x 4200 mm (가벽 및 중문 포함)
       const W = 5200, D = 4200;
       state.roomName = '② 분리형 1.5룸 (5200 × 4200 mm)';
       setRoomDimensionInputs(W, D, h);
       buildRectangularRoomWalls(W, D, t, h);
-      // 중앙 분리 가벽
       state.walls.push({
         id: 'wall_partition_1',
         x1: -200, z1: -D / 2,
@@ -328,7 +883,6 @@
         height: h,
         isInterior: true
       });
-      // 현관문, 침실 방문, 거실 대형 창문
       state.openings.push({
         id: 'open_door_main',
         wallId: 'wall_bottom',
@@ -368,7 +922,6 @@
         sill: 850
       });
     } else if (presetKey === 'aptbed') {
-      // ③ 국민평형 아파트 침실형 3600 x 3900 mm
       const W = 3600, D = 3900;
       state.roomName = '③ 국민평형 침실형 (3600 × 3900 mm)';
       setRoomDimensionInputs(W, D, h);
@@ -393,7 +946,6 @@
         sill: 750
       });
     } else if (presetKey === 'lshape') {
-      // ④ ㄱ자형 구조 (5000 x 4800 mm 코너형)
       const W = 5000, D = 4800;
       state.roomName = '④ ㄱ자형 코너 구조 (5000 × 4800 mm)';
       setRoomDimensionInputs(W, D, h);
@@ -437,15 +989,6 @@
         height: 1250,
         sill: 800
       });
-      state.openings.push({
-        id: 'open_win_l2',
-        wallId: 'wall_l_1',
-        type: 'window',
-        t: 0.5,
-        width: 1400,
-        height: 1250,
-        sill: 800
-      });
     }
 
     if (includeSampleFurniture) {
@@ -453,11 +996,10 @@
       furnitureMeshMap.clear();
       clearThreeGroup(furnitureGroup);
 
-      // 초기 데모 가구 배치 (원룸 기준 깔끔한 배치)
-      addFurnitureFromTemplate(DEFAULT_CATALOG[0], { x: -1100, z: -1050, rotY: 0 });   // 싱글 침대
-      addFurnitureFromTemplate(DEFAULT_CATALOG[2], { x: 950,   z: -1650, rotY: 0 });   // 데스크
-      addFurnitureFromTemplate(DEFAULT_CATALOG[3], { x: 950,   z: -950,  rotY: 180 }); // 오피스 의자
-      addFurnitureFromTemplate(DEFAULT_CATALOG[4], { x: 1150,  z: 750,   rotY: -90 }); // 옷장
+      addFurnitureFromTemplate(DEFAULT_CATALOG[0], { x: -1100, z: -1050, rotY: 0 });
+      addFurnitureFromTemplate(DEFAULT_CATALOG[2], { x: 950,   z: -1650, rotY: 0 });
+      addFurnitureFromTemplate(DEFAULT_CATALOG[3], { x: 950,   z: -950,  rotY: 180 });
+      addFurnitureFromTemplate(DEFAULT_CATALOG[4], { x: 1150,  z: 750,   rotY: -90 });
     }
 
     document.getElementById('hud-room-text').textContent = state.roomName;
@@ -491,7 +1033,6 @@
     document.getElementById('room-height-input').value = h;
   }
 
-  // ==================== 3D ROOM EXTRUSION BUILDER ====================
   function clearThreeGroup(group) {
     while (group.children.length > 0) {
       const child = group.children[0];
@@ -504,7 +1045,7 @@
     wallMeshes.length = 0;
     doorSwingZones.length = 0;
 
-    // 1. Floor Mesh Extrusion from floorPolygon (or bounding box of walls)
+    // 1. Floor Mesh Extrusion
     const poly = getEffectiveFloorPolygon();
     if (poly.length >= 3) {
       const shape = new THREE.Shape();
@@ -521,7 +1062,6 @@
       floorGeo.rotateX(-Math.PI / 2);
       floorGeo.translate(0, -0.04, 0);
 
-      // Subtle wood-herringbone procedural canvas texture for floor
       const floorMat = new THREE.MeshStandardMaterial({
         map: createProceduralFloorTexture(),
         roughness: 0.75,
@@ -533,7 +1073,7 @@
       roomGroup.add(floorMesh);
     }
 
-    // 2. Extrude 3D Walls & Openings (Doors + 900mm Swing Arc, Windows)
+    // 2. Extrude Walls with Openings
     const wallMatBase = new THREE.MeshStandardMaterial({
       color: 0x2F333D,
       roughness: 0.85,
@@ -564,7 +1104,6 @@
       wallContainer.position.set(midX, 0, midZ);
       wallContainer.rotation.y = -angle;
 
-      // Normal vector pointing outward from room center (0,0)
       const normalX = Math.sin(angle);
       const normalZ = -Math.cos(angle);
       const dotSign = (midX * normalX + midZ * normalZ) >= 0 ? 1 : -1;
@@ -590,7 +1129,6 @@
         mesh.receiveShadow = true;
         wallContainer.add(mesh);
       } else {
-        // Segmented wall construction around doors & windows
         let cursorMM = -lenMM / 2;
         wallOpenings.forEach((op) => {
           const opCenterMM = (op.t - 0.5) * lenMM;
@@ -598,7 +1136,6 @@
           const opStartMM = Math.max(-lenMM / 2 + 40, opCenterMM - halfW);
           const opEndMM = Math.min(lenMM / 2 - 40, opCenterMM + halfW);
 
-          // Left solid segment before opening
           const segLenMM = opStartMM - cursorMM;
           if (segLenMM > 10) {
             const segU = segLenMM * MM_TO_UNIT;
@@ -616,7 +1153,6 @@
           const opHeightU = (op.height || 2100) * MM_TO_UNIT;
           const sillU = (op.sill || 0) * MM_TO_UNIT;
 
-          // Header segment above door/window
           const topHeadU = heightU - (sillU + opHeightU);
           if (topHeadU > 0.02) {
             const headGeo = new THREE.BoxGeometry(opWidthU, topHeadU, thickU);
@@ -626,7 +1162,6 @@
             wallContainer.add(headMesh);
           }
 
-          // Sill segment below window
           if (sillU > 0.02) {
             const sillGeo = new THREE.BoxGeometry(opWidthU, sillU, thickU);
             sillGeo.translate(opCenterU, sillU / 2, 0);
@@ -635,9 +1170,8 @@
             wallContainer.add(sillMesh);
           }
 
-          // Build Door or Window 3D Fixture
           if (op.type === 'door') {
-            build3DDoorFixture(wallContainer, opCenterU, opWidthU, opHeightU, thickU, wall, angle, op);
+            build3DDoorFixture(wallContainer, opCenterU, opWidthU, opHeightU, thickU, op);
           } else if (op.type === 'window') {
             build3DWindowFixture(wallContainer, opCenterU, sillU, opWidthU, opHeightU, thickU);
           }
@@ -645,7 +1179,6 @@
           cursorMM = opEndMM;
         });
 
-        // Right solid segment after last opening
         const tailMM = lenMM / 2 - cursorMM;
         if (tailMM > 10) {
           const tailU = tailMM * MM_TO_UNIT;
@@ -659,7 +1192,6 @@
         }
       }
 
-      // Baseboard trim
       const baseGeo = new THREE.BoxGeometry(lenU, 0.06, thickU + 0.008);
       baseGeo.translate(0, 0.03, 0);
       const baseMesh = new THREE.Mesh(baseGeo, baseboardMat);
@@ -670,7 +1202,7 @@
     });
   }
 
-  function build3DDoorFixture(wallContainer, centerU, widthU, heightU, thickU, wall, wallAngle, op) {
+  function build3DDoorFixture(wallContainer, centerU, widthU, heightU, thickU, op) {
     const frameMat = new THREE.MeshStandardMaterial({ color: 0x4B5563, roughness: 0.5 });
     const panelMat = new THREE.MeshStandardMaterial({
       color: 0x8B6F4E,
@@ -679,7 +1211,6 @@
       opacity: 0.92
     });
 
-    // Door Frame
     const frameThick = 0.04;
     const leftPost = new THREE.Mesh(new THREE.BoxGeometry(frameThick, heightU, thickU + 0.02), frameMat);
     leftPost.position.set(centerU - widthU / 2 + frameThick / 2, heightU / 2, 0);
@@ -689,13 +1220,11 @@
     rightPost.position.set(centerU + widthU / 2 - frameThick / 2, heightU / 2, 0);
     wallContainer.add(rightPost);
 
-    // Slightly ajar door leaf (opened at 65 degrees into the room)
-    const swingRadiusU = 0.9; // 900mm standard door clearance radius
+    const swingRadiusU = 0.9;
     const hingeX = centerU - widthU / 2 + frameThick;
     const doorPivot = new THREE.Group();
     doorPivot.position.set(hingeX, 0, 0);
 
-    // Determine inward swing direction
     const inwardSign = (op.swingDir || 1);
     doorPivot.rotation.y = inwardSign * (Math.PI * 0.38);
 
@@ -706,20 +1235,12 @@
     leafMesh.castShadow = true;
     doorPivot.add(leafMesh);
 
-    // Door Handle
-    const handleMat = new THREE.MeshStandardMaterial({ color: 0xD1D5DB, metalness: 0.8, roughness: 0.2 });
-    const handle = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.025, 0.09), handleMat);
-    handle.position.set(leafW - 0.09, 0.95, 0);
-    doorPivot.add(handle);
-
     wallContainer.add(doorPivot);
 
-    // 900mm Door Swing Ergonomic Sector on the Floor
     const sectorGeo = new THREE.CircleGeometry(swingRadiusU, 28, 0, Math.PI / 2);
     sectorGeo.rotateX(-Math.PI / 2);
-    if (inwardSign < 0) {
-      sectorGeo.scale(1, 1, -1);
-    }
+    if (inwardSign < 0) sectorGeo.scale(1, 1, -1);
+
     const sectorMat = new THREE.MeshBasicMaterial({
       color: 0x4F46E5,
       transparent: true,
@@ -733,7 +1254,6 @@
     sectorMesh.visible = state.globalErgoVisible;
     wallContainer.add(sectorMesh);
 
-    // Arc Outline for 900mm Door Swing
     const arcPts = [];
     for (let i = 0; i <= 24; i++) {
       const a = (i / 24) * (Math.PI / 2);
@@ -750,7 +1270,6 @@
     arcLine.visible = state.globalErgoVisible;
     wallContainer.add(arcLine);
 
-    // Compute world-space bounding box of the 900mm door swing zone for collision checks
     const localSwingCenter = new THREE.Vector3(
       centerU,
       0.4,
@@ -784,14 +1303,12 @@
     const frameGroup = new THREE.Group();
     frameGroup.position.set(centerU, sillU + heightU / 2, 0);
 
-    // Outer frame bars
     const barT = 0.045;
     const topBar = new THREE.Mesh(new THREE.BoxGeometry(widthU, barT, thickU + 0.02), frameMat);
     topBar.position.y = heightU / 2 - barT / 2;
     const botBar = new THREE.Mesh(new THREE.BoxGeometry(widthU, barT, thickU + 0.03), frameMat);
     botBar.position.y = -heightU / 2 + barT / 2;
     const midMullion = new THREE.Mesh(new THREE.BoxGeometry(barT, heightU, thickU + 0.01), frameMat);
-
     const glassPane = new THREE.Mesh(new THREE.BoxGeometry(widthU - barT * 2, heightU - barT * 2, 0.018), glassMat);
 
     frameGroup.add(topBar, botBar, midMullion, glassPane);
@@ -833,13 +1350,11 @@
     ctx.fillStyle = '#262423';
     ctx.fillRect(0, 0, 256, 256);
 
-    // Subtle dark wood plank lines
     ctx.strokeStyle = '#1E1C1B';
     ctx.lineWidth = 2;
     for (let y = 0; y < 256; y += 32) {
       ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(256, y);
+      ctx.moveTo(0, y); ctx.lineTo(256, y);
       ctx.stroke();
 
       const offset = (y / 32) % 2 === 0 ? 64 : 160;
@@ -856,248 +1371,75 @@
     return tex;
   }
 
-  // ==================== [기능 2 & 3] 절차적 3D 가구 생성 알고리즘 (Procedural Mesh Generator) ====================
-  function createProceduralFurnitureGroup(itemData) {
+  // ==================== [기능 2 & 3] 3D 가구 조립 렌더러 (buildFurnitureFromAIJson) ====================
+  function buildFurnitureFromAIJson(blueprint, itemData) {
     const group = new THREE.Group();
     group.name = 'Furniture_' + itemData.id;
-    group.userData = { furnitureId: itemData.id };
+    group.userData = { furnitureId: itemData.id, itemData };
+
+    const visualMeshes = new THREE.Group();
+    visualMeshes.name = 'VisualMeshes';
+
+    const parts = Array.isArray(blueprint?.parts) ? blueprint.parts : [];
+
+    parts.forEach((p) => {
+      const shape = (p.shape || 'box').toLowerCase();
+      const size = p.size || [100, 100, 100];
+      const pos = p.position || [0, 0, 0];
+      const rot = p.rotation || [0, 0, 0];
+      const partColor = p.color || itemData.color || '#8B6F4E';
+      const partMatType = p.materialType || itemData.materialType || 'wood';
+
+      const mat = createProceduralMaterial(partMatType, partColor);
+      let geo = null;
+
+      if (shape === 'cylinder') {
+        const rTop = Math.max(0.005, (size[0] || 50) * MM_TO_UNIT);
+        const rBot = Math.max(0.005, (size[1] !== undefined ? size[1] : size[0]) * MM_TO_UNIT);
+        const h = Math.max(0.01, (size[2] || 100) * MM_TO_UNIT);
+        geo = new THREE.CylinderGeometry(rTop, rBot, h, 24);
+      } else if (shape === 'sphere') {
+        const r = Math.max(0.01, (size[0] || 50) * MM_TO_UNIT);
+        geo = new THREE.SphereGeometry(r, 20, 16);
+      } else {
+        const w = Math.max(0.01, (size[0] || 100) * MM_TO_UNIT);
+        const h = Math.max(0.01, (size[1] || 100) * MM_TO_UNIT);
+        const d = Math.max(0.01, (size[2] || 100) * MM_TO_UNIT);
+        geo = new THREE.BoxGeometry(w, h, d);
+      }
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.name = p.name || 'Part';
+      mesh.position.set(pos[0] * MM_TO_UNIT, pos[1] * MM_TO_UNIT, pos[2] * MM_TO_UNIT);
+      mesh.rotation.set(
+        THREE.MathUtils.degToRad(rot[0] || 0),
+        THREE.MathUtils.degToRad(rot[1] || 0),
+        THREE.MathUtils.degToRad(rot[2] || 0)
+      );
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      visualMeshes.add(mesh);
+    });
+
+    group.add(visualMeshes);
 
     const W = itemData.w * MM_TO_UNIT;
     const D = itemData.d * MM_TO_UNIT;
     const H = itemData.h * MM_TO_UNIT;
 
-    // Prepare Primary Material (supports AI CanvasTexture if uploaded)
-    let mainTexture = null;
-    if (itemData.textureDataUrl) {
-      const img = new Image();
-      img.src = itemData.textureDataUrl;
-      mainTexture = new THREE.CanvasTexture(img);
-      img.onload = () => {
-        mainTexture.needsUpdate = true;
-      };
-    }
-
-    const primaryMat = new THREE.MeshStandardMaterial({
-      color: mainTexture ? 0xFFFFFF : new THREE.Color(itemData.color || '#8B6F4E'),
-      map: mainTexture || null,
-      roughness: 0.58,
-      metalness: 0.08
-    });
-
-    const secondaryMat = new THREE.MeshStandardMaterial({
-      color: 0x272932,
-      roughness: 0.45,
-      metalness: 0.5
-    });
-
-    const fabricLightMat = new THREE.MeshStandardMaterial({
-      color: 0xE5E7EB,
-      roughness: 0.85,
-      metalness: 0.02
-    });
-
-    const meshContainer = new THREE.Group();
-    meshContainer.name = 'VisualMeshes';
-
-    const cat = itemData.category;
-    const shape = itemData.shape || 'legged';
-
-    // Category + Shape aware compound geometry construction
-    if (cat === 'bed') {
-      // Bed Frame + Headboard + Legs + Mattress + Pillows + Blanket
-      const legH = Math.min(0.16, H * 0.2);
-      const baseH = Math.max(0.16, H * 0.25);
-      const mattH = Math.max(0.18, H * 0.24);
-
-      addFourCornerLegs(meshContainer, W, D, legH, 0.045, secondaryMat);
-
-      // Bed frame base
-      const frameMesh = createBoxMesh(W, baseH, D, primaryMat, 0, legH + baseH / 2, 0);
-      meshContainer.add(frameMesh);
-
-      // Headboard at -Z
-      const headThick = Math.min(0.11, D * 0.06);
-      const headMesh = createBoxMesh(W, H - legH, headThick, primaryMat, 0, legH + (H - legH) / 2, -D / 2 + headThick / 2);
-      meshContainer.add(headMesh);
-
-      // Mattress
-      const mattW = W * 0.94;
-      const mattD = D - headThick - 0.05;
-      const mattY = legH + baseH + mattH / 2;
-      const mattMesh = createBoxMesh(mattW, mattH, mattD, fabricLightMat, 0, mattY, headThick / 2);
-      meshContainer.add(mattMesh);
-
-      // Duvet / Blanket cover in primary color
-      const duvetMesh = createBoxMesh(mattW + 0.01, mattH * 0.65, mattD * 0.65, primaryMat, 0, mattY + 0.015, headThick / 2 + mattD * 0.16);
-      meshContainer.add(duvetMesh);
-
-      // Pillows (1 for single, 2 for queen/wide)
-      const pillowCount = itemData.w >= 1350 ? 2 : 1;
-      const pillowW = pillowCount === 2 ? mattW * 0.4 : mattW * 0.58;
-      for (let i = 0; i < pillowCount; i++) {
-        const px = pillowCount === 2 ? (i === 0 ? -mattW * 0.24 : mattW * 0.24) : 0;
-        const pillow = createBoxMesh(pillowW, 0.09, 0.34, fabricLightMat, px, legH + baseH + mattH + 0.04, -D / 2 + headThick + 0.24);
-        meshContainer.add(pillow);
-      }
-    } else if (cat === 'desk') {
-      if (shape === 'lshape') {
-        // L-Shape Corner Desk
-        const topThick = Math.min(0.05, H * 0.07);
-        const legH = H - topThick;
-        const wingW = W * 0.42;
-        const wingD = D * 0.45;
-
-        // Main desktop bar + side return bar
-        const topMain = createBoxMesh(W, topThick, wingD, primaryMat, 0, H - topThick / 2, -D / 2 + wingD / 2);
-        const topSide = createBoxMesh(wingW, topThick, D - wingD, primaryMat, -W / 2 + wingW / 2, H - topThick / 2, wingD / 2);
-        meshContainer.add(topMain, topSide);
-
-        const legPositions = [
-          [-W / 2 + 0.05, -D / 2 + 0.05],
-          [W / 2 - 0.05,  -D / 2 + 0.05],
-          [W / 2 - 0.05,  -D / 2 + wingD - 0.05],
-          [-W / 2 + 0.05, D / 2 - 0.05],
-          [-W / 2 + wingW - 0.05, D / 2 - 0.05]
-        ];
-        legPositions.forEach(([lx, lz]) => {
-          const leg = createCylinderMesh(0.025, 0.025, legH, secondaryMat, lx, legH / 2, lz);
-          meshContainer.add(leg);
-        });
-      } else if (shape === 'cylinder') {
-        // Round / Cafe Pedestal Table
-        const topThick = 0.04;
-        const radius = Math.min(W, D) / 2;
-        const topCyl = createCylinderMesh(radius, radius, topThick, primaryMat, 0, H - topThick / 2, 0);
-        const pole = createCylinderMesh(0.05, 0.05, H - topThick, secondaryMat, 0, (H - topThick) / 2, 0);
-        const basePlate = createCylinderMesh(radius * 0.55, radius * 0.55, 0.025, secondaryMat, 0, 0.0125, 0);
-        meshContainer.add(topCyl, pole, basePlate);
-      } else {
-        // Standard Desk / Table with Legs, Crossbar & Monitor Prop
-        const topThick = 0.04;
-        const legH = H - topThick;
-        const topMesh = createBoxMesh(W, topThick, D, primaryMat, 0, H - topThick / 2, 0);
-        meshContainer.add(topMesh);
-        addFourCornerLegs(meshContainer, W * 0.92, D * 0.88, legH, 0.04, secondaryMat);
-
-        // Modesty / structural bar
-        const bar = createBoxMesh(W * 0.88, 0.04, 0.03, secondaryMat, 0, legH * 0.72, -D * 0.38);
-        meshContainer.add(bar);
-
-        // If it's the work desk catalog item, add a sleek monitor + keyboard prop
-        if (itemData.catalogId === 'desk_work') {
-          const stand = createBoxMesh(0.18, 0.14, 0.14, secondaryMat, 0, H + 0.07, -D * 0.25);
-          const screen = createBoxMesh(0.62, 0.36, 0.025, secondaryMat, 0, H + 0.26, -D * 0.23);
-          const pad = createBoxMesh(0.68, 0.006, 0.28, secondaryMat, 0, H + 0.004, D * 0.1);
-          meshContainer.add(stand, screen, pad);
-        }
-      }
-    } else if (cat === 'chair') {
-      if (itemData.catalogId === 'chair_office' || shape === 'cylinder') {
-        // Swivel Office Chair or Cylindrical Lounge Chair
-        const seatY = H * 0.46;
-        const baseStar = createCylinderMesh(W * 0.42, W * 0.45, 0.04, secondaryMat, 0, 0.04, 0);
-        const gasLift = createCylinderMesh(0.03, 0.03, seatY - 0.04, secondaryMat, 0, seatY / 2, 0);
-        const seat = createBoxMesh(W * 0.82, 0.07, D * 0.8, primaryMat, 0, seatY, 0);
-        const back = createBoxMesh(W * 0.76, H - seatY - 0.04, 0.06, primaryMat, 0, seatY + (H - seatY) / 2, -D * 0.36);
-        // Armrests
-        const armL = createBoxMesh(0.045, 0.2, D * 0.5, secondaryMat, -W * 0.42, seatY + 0.12, -0.02);
-        const armR = createBoxMesh(0.045, 0.2, D * 0.5, secondaryMat, W * 0.42, seatY + 0.12, -0.02);
-        meshContainer.add(baseStar, gasLift, seat, back, armL, armR);
-      } else if (shape === 'lshape') {
-        // L-Shape Sectional Sofa
-        const legH = 0.08;
-        const seatH = H * 0.42;
-        const backH = H - legH - seatH;
-        const mainSeat = createBoxMesh(W, seatH, D * 0.58, primaryMat, 0, legH + seatH / 2, -D * 0.21);
-        const chaiseSeat = createBoxMesh(W * 0.36, seatH, D * 0.42, primaryMat, W * 0.32, legH + seatH / 2, D * 0.29);
-        const backrest = createBoxMesh(W, backH, 0.16, primaryMat, 0, legH + seatH + backH / 2, -D / 2 + 0.08);
-        addFourCornerLegs(meshContainer, W * 0.94, D * 0.9, legH, 0.04, secondaryMat);
-        meshContainer.add(mainSeat, chaiseSeat, backrest);
-      } else {
-        // Sofa or Armchair with Backrest, Armrests & Legs
-        const legH = 0.1;
-        const seatH = (H - legH) * 0.42;
-        const armW = Math.min(0.16, W * 0.14);
-        addFourCornerLegs(meshContainer, W * 0.92, D * 0.88, legH, 0.04, secondaryMat);
-
-        const seatBase = createBoxMesh(W - armW * 2, seatH, D * 0.88, primaryMat, 0, legH + seatH / 2, 0.03);
-        const backrest = createBoxMesh(W - armW * 2, H - legH - seatH, D * 0.2, primaryMat, 0, legH + seatH + (H - legH - seatH) / 2, -D / 2 + D * 0.1);
-        const armL = createBoxMesh(armW, (H - legH) * 0.68, D, primaryMat, -W / 2 + armW / 2, legH + (H - legH) * 0.34, 0);
-        const armR = createBoxMesh(armW, (H - legH) * 0.68, D, primaryMat, W / 2 - armW / 2, legH + (H - legH) * 0.34, 0);
-        meshContainer.add(seatBase, backrest, armL, armR);
-      }
-    } else if (cat === 'wardrobe' || cat === 'appliance') {
-      if (itemData.catalogId === 'bookshelf_5tier') {
-        // 5-Tier Open Bookshelf
-        const sideT = 0.03;
-        const leftP = createBoxMesh(sideT, H, D, primaryMat, -W / 2 + sideT / 2, H / 2, 0);
-        const rightP = createBoxMesh(sideT, H, D, primaryMat, W / 2 - sideT / 2, H / 2, 0);
-        const backP = createBoxMesh(W, H, 0.015, primaryMat, 0, H / 2, -D / 2 + 0.008);
-        meshContainer.add(leftP, rightP, backP);
-        for (let i = 0; i <= 5; i++) {
-          const sy = (i / 5) * (H - 0.03) + 0.015;
-          const shelf = createBoxMesh(W - sideT * 2, 0.025, D - 0.01, primaryMat, 0, sy, 0);
-          meshContainer.add(shelf);
-        }
-      } else {
-        // Wardrobe / Cabinet / Appliance with Door Seam & Handles
-        const body = createBoxMesh(W, H - 0.04, D - 0.02, primaryMat, 0, (H - 0.04) / 2 + 0.04, -0.01);
-        const plinth = createBoxMesh(W * 0.96, 0.04, D * 0.92, secondaryMat, 0, 0.02, 0);
-        const doorL = createBoxMesh(W / 2 - 0.008, H - 0.06, 0.02, primaryMat, -W / 4, H / 2 + 0.01, D / 2 - 0.01);
-        const doorR = createBoxMesh(W / 2 - 0.008, H - 0.06, 0.02, primaryMat, W / 4, H / 2 + 0.01, D / 2 - 0.01);
-        const handleL = createBoxMesh(0.018, 0.22, 0.025, secondaryMat, -0.04, H * 0.52, D / 2 + 0.01);
-        const handleR = createBoxMesh(0.018, 0.22, 0.025, secondaryMat, 0.04, H * 0.52, D / 2 + 0.01);
-        meshContainer.add(body, plinth, doorL, doorR, handleL, handleR);
-      }
-    } else {
-      // Decor / Floor Lamp / Custom Shape Fallback
-      if (itemData.catalogId === 'lamp_floor' || (cat === 'decor' && H > 1.0)) {
-        const base = createCylinderMesh(W * 0.38, W * 0.42, 0.035, secondaryMat, 0, 0.018, 0);
-        const pole = createCylinderMesh(0.018, 0.018, H - 0.3, secondaryMat, 0, (H - 0.3) / 2 + 0.03, 0);
-        const shadeMat = new THREE.MeshStandardMaterial({
-          color: new THREE.Color(itemData.color || '#F59E0B'),
-          emissive: new THREE.Color(itemData.color || '#F59E0B'),
-          emissiveIntensity: 0.35,
-          roughness: 0.4
-        });
-        const shade = createCylinderMesh(W * 0.32, W * 0.48, 0.32, shadeMat, 0, H - 0.16, 0);
-        meshContainer.add(base, pole, shade);
-      } else if (shape === 'cylinder') {
-        const cyl = createCylinderMesh(W / 2, W * 0.45, H, primaryMat, 0, H / 2, 0);
-        meshContainer.add(cyl);
-      } else if (shape === 'lshape') {
-        const b1 = createBoxMesh(W, H, D * 0.45, primaryMat, 0, H / 2, -D * 0.275);
-        const b2 = createBoxMesh(W * 0.45, H, D * 0.55, primaryMat, -W * 0.275, H / 2, D * 0.225);
-        meshContainer.add(b1, b2);
-      } else if (shape === 'legged') {
-        const legH = H * 0.35;
-        addFourCornerLegs(meshContainer, W * 0.9, D * 0.9, legH, 0.035, secondaryMat);
-        const topBox = createBoxMesh(W, H - legH, D, primaryMat, 0, legH + (H - legH) / 2, 0);
-        meshContainer.add(topBox);
-      } else {
-        const box = createBoxMesh(W, H, D, primaryMat, 0, H / 2, 0);
-        meshContainer.add(box);
-      }
-    }
-
-    group.add(meshContainer);
-    group.userData.primaryMaterial = primaryMat;
-
-    // Selection & Collision Bounding Wireframe Box (#4F46E5 when selected, #EF4444 when colliding)
     const boundGeo = new THREE.BoxGeometry(W + 0.02, H + 0.02, D + 0.02);
     boundGeo.translate(0, H / 2, 0);
-    const edgesGeo = new THREE.EdgesGeometry(boundGeo);
+
     const outlineMat = new THREE.LineBasicMaterial({
       color: 0x4F46E5,
       linewidth: 2,
       transparent: true,
       opacity: 0.0
     });
-    const outlineBox = new THREE.LineSegments(edgesGeo, outlineMat);
+    const outlineBox = new THREE.LineSegments(new THREE.EdgesGeometry(boundGeo), outlineMat);
     outlineBox.name = 'SelectionOutline';
     group.add(outlineBox);
 
-    // Red Collision Tint Shell (shown when colliding)
     const tintMat = new THREE.MeshBasicMaterial({
       color: 0xEF4444,
       transparent: true,
@@ -1108,7 +1450,6 @@
     tintBox.name = 'CollisionShell';
     group.add(tintBox);
 
-    // Ergonomic Activity Clearance Zone on Floor (생활과학 동선 반경)
     const frontClearance = (itemData.ergoClearance?.front || 550) * MM_TO_UNIT;
     const sideClearance = (itemData.ergoClearance?.side || 200) * MM_TO_UNIT;
     const ergoW = W + sideClearance * 2;
@@ -1130,17 +1471,14 @@
     ergoPlane.visible = state.globalErgoVisible && (itemData.ergoVisible !== false);
     group.add(ergoPlane);
 
-    // Front Direction Indicator Arrow on Ergo Zone
-    const ergoEdge = new THREE.EdgesGeometry(ergoGeo);
     const ergoLine = new THREE.LineSegments(
-      ergoEdge,
+      new THREE.EdgesGeometry(ergoGeo),
       new THREE.LineBasicMaterial({ color: 0x34D399, transparent: true, opacity: 0.45 })
     );
     ergoLine.name = 'ErgoZoneLine';
     ergoLine.visible = ergoPlane.visible;
     group.add(ergoLine);
 
-    // Apply Transform
     group.position.set(
       itemData.x * MM_TO_UNIT,
       (itemData.y || 0) * MM_TO_UNIT,
@@ -1151,47 +1489,822 @@
     return group;
   }
 
-  function createBoxMesh(w, h, d, mat, x, y, z) {
-    const geo = new THREE.BoxGeometry(w, h, d);
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(x, y, z);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    return mesh;
+  // ==================== [기능 3-1] 스마트 파라미터 프리셋 블루프린트 생성기 ====================
+  function generateSmartBlueprint(shapeKey, W, D, H, color, matType) {
+    const parts = [];
+    const mainColor = color || '#8B6F4E';
+    const subColor = '#2B2D35';
+    const primaryMat = matType || 'wood';
+
+    if (shapeKey === 'round_slanted_table') {
+      const topThick = Math.min(38, H * 0.08);
+      const radius = Math.min(W, D) / 2;
+      const legLen = H - topThick;
+      const legTopR = Math.max(16, radius * 0.07);
+      const legBotR = Math.max(11, radius * 0.045);
+      const tiltDeg = 11.5;
+
+      parts.push({
+        name: 'tabletop_round',
+        shape: 'cylinder',
+        size: [radius, radius, topThick],
+        position: [0, H - topThick / 2, 0],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: primaryMat
+      });
+
+      const legSpread = radius * 0.65;
+      const legAngles = [45, 135, 225, 315];
+      legAngles.forEach((deg, idx) => {
+        const rad = THREE.MathUtils.degToRad(deg);
+        const px = Math.cos(rad) * legSpread;
+        const pz = Math.sin(rad) * legSpread;
+        const rx = -Math.sin(rad) * tiltDeg;
+        const rz = Math.cos(rad) * tiltDeg;
+
+        parts.push({
+          name: `slanted_leg_${idx + 1}`,
+          shape: 'cylinder',
+          size: [legTopR, legBotR, legLen],
+          position: [px, legLen / 2, pz],
+          rotation: [rx, deg, rz],
+          color: mainColor,
+          materialType: 'wood'
+        });
+      });
+
+      parts.push({
+        name: 'under_brace_ring',
+        shape: 'cylinder',
+        size: [radius * 0.72, radius * 0.72, 16],
+        position: [0, H - topThick - 8, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'lower_foot_ring',
+        shape: 'cylinder',
+        size: [radius * 0.55, radius * 0.55, 12],
+        position: [0, legLen * 0.3, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+    } else if (shapeKey === 'modern_rect_desk') {
+      const topThick = 40;
+      const legH = H - topThick;
+      const legThick = 38;
+
+      parts.push({
+        name: 'desktop_surface',
+        shape: 'box',
+        size: [W, topThick, D],
+        position: [0, H - topThick / 2, 0],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: primaryMat
+      });
+
+      const lx = -W / 2 + 50;
+      parts.push({
+        name: 'leg_loop_left_front',
+        shape: 'box',
+        size: [legThick, legH, legThick],
+        position: [lx, legH / 2, D / 2 - 40],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'leg_loop_left_back',
+        shape: 'box',
+        size: [legThick, legH, legThick],
+        position: [lx, legH / 2, -D / 2 + 40],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'leg_loop_left_bottom',
+        shape: 'box',
+        size: [legThick, legThick, D - 40],
+        position: [lx, legThick / 2, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+
+      const rx = W / 2 - 50;
+      parts.push({
+        name: 'leg_loop_right_front',
+        shape: 'box',
+        size: [legThick, legH, legThick],
+        position: [rx, legH / 2, D / 2 - 40],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'leg_loop_right_back',
+        shape: 'box',
+        size: [legThick, legH, legThick],
+        position: [rx, legH / 2, -D / 2 + 40],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'leg_loop_right_bottom',
+        shape: 'box',
+        size: [legThick, legThick, D - 40],
+        position: [rx, legThick / 2, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+
+      parts.push({
+        name: 'cable_crossbar',
+        shape: 'box',
+        size: [W - 140, 60, 20],
+        position: [0, legH * 0.75, -D * 0.35],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+    } else if (shapeKey === 'cushion_sofa_armchair') {
+      const legH = Math.max(90, H * 0.16);
+      const baseH = Math.max(120, H * 0.22);
+      const armW = Math.min(140, W * 0.14);
+      const seatW = W - armW * 2;
+      const backH = H - legH - baseH;
+
+      const legPositions = [
+        [-W / 2 + 60, -D / 2 + 60],
+        [W / 2 - 60,  -D / 2 + 60],
+        [W / 2 - 60,  D / 2 - 60],
+        [-W / 2 + 60, D / 2 - 60]
+      ];
+      legPositions.forEach(([lx, lz], idx) => {
+        parts.push({
+          name: `sofa_leg_${idx + 1}`,
+          shape: 'cylinder',
+          size: [24, 16, legH],
+          position: [lx, legH / 2, lz],
+          rotation: [0, 0, 0],
+          color: subColor,
+          materialType: 'metal'
+        });
+      });
+
+      parts.push({
+        name: 'seat_chassis',
+        shape: 'box',
+        size: [seatW, baseH, D * 0.88],
+        position: [0, legH + baseH / 2, 20],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'fabric'
+      });
+
+      parts.push({
+        name: 'seat_cushion_top',
+        shape: 'box',
+        size: [seatW - 20, 90, D * 0.82],
+        position: [0, legH + baseH + 45, 20],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'fabric'
+      });
+
+      parts.push({
+        name: 'backrest_cushion',
+        shape: 'box',
+        size: [seatW, backH, 180],
+        position: [0, legH + baseH + backH / 2, -D / 2 + 90],
+        rotation: [-7, 0, 0],
+        color: mainColor,
+        materialType: 'fabric'
+      });
+
+      parts.push({
+        name: 'armrest_left',
+        shape: 'box',
+        size: [armW, (H - legH) * 0.72, D],
+        position: [-W / 2 + armW / 2, legH + (H - legH) * 0.36, 0],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'fabric'
+      });
+      parts.push({
+        name: 'armrest_right',
+        shape: 'box',
+        size: [armW, (H - legH) * 0.72, D],
+        position: [W / 2 - armW / 2, legH + (H - legH) * 0.36, 0],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'fabric'
+      });
+    } else if (shapeKey === 'open_shelf_bookcase') {
+      const sideT = 30;
+      const shelfT = 24;
+      parts.push({
+        name: 'upright_left',
+        shape: 'box',
+        size: [sideT, H, D],
+        position: [-W / 2 + sideT / 2, H / 2, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'upright_right',
+        shape: 'box',
+        size: [sideT, H, D],
+        position: [W / 2 - sideT / 2, H / 2, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      const shelfW = W - sideT * 2;
+      for (let i = 0; i < 5; i++) {
+        const sy = 60 + i * ((H - 120) / 4);
+        parts.push({
+          name: `shelf_tier_${i + 1}`,
+          shape: 'box',
+          size: [shelfW, shelfT, D - 10],
+          position: [0, sy, 0],
+          rotation: [0, 0, 0],
+          color: mainColor,
+          materialType: 'wood'
+        });
+      }
+      parts.push({
+        name: 'rear_x_brace_1',
+        shape: 'cylinder',
+        size: [6, 6, Math.hypot(shelfW, H * 0.6)],
+        position: [0, H * 0.5, -D / 2 + 8],
+        rotation: [0, 0, 36],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'rear_x_brace_2',
+        shape: 'cylinder',
+        size: [6, 6, Math.hypot(shelfW, H * 0.6)],
+        position: [0, H * 0.5, -D / 2 + 8],
+        rotation: [0, 0, -36],
+        color: subColor,
+        materialType: 'metal'
+      });
+    } else if (shapeKey === 'office_swivel_chair') {
+      const seatY = H * 0.46;
+      parts.push({
+        name: 'chair_caster_base',
+        shape: 'cylinder',
+        size: [W * 0.42, W * 0.46, 36],
+        position: [0, 24, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'gas_lift_piston',
+        shape: 'cylinder',
+        size: [28, 28, seatY - 24],
+        position: [0, seatY / 2, 0],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'chair_seat_cushion',
+        shape: 'box',
+        size: [W * 0.82, 65, D * 0.78],
+        position: [0, seatY, 0],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'fabric'
+      });
+      parts.push({
+        name: 'chair_backrest_mesh',
+        shape: 'box',
+        size: [W * 0.74, H - seatY - 40, 50],
+        position: [0, seatY + (H - seatY) / 2, -D * 0.35],
+        rotation: [-4, 0, 0],
+        color: mainColor,
+        materialType: 'fabric'
+      });
+      parts.push({
+        name: 'armrest_left_t',
+        shape: 'box',
+        size: [45, 180, D * 0.45],
+        position: [-W * 0.42, seatY + 110, -10],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'plastic'
+      });
+      parts.push({
+        name: 'armrest_right_t',
+        shape: 'box',
+        size: [45, 180, D * 0.45],
+        position: [W * 0.42, seatY + 110, -10],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'plastic'
+      });
+    } else {
+      const baseH = H * 0.3;
+      parts.push({
+        name: 'primary_frame',
+        shape: 'box',
+        size: [W, baseH, D],
+        position: [0, baseH / 2, 0],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: primaryMat
+      });
+      parts.push({
+        name: 'headboard',
+        shape: 'box',
+        size: [W, H - baseH, 70],
+        position: [0, baseH + (H - baseH) / 2, -D / 2 + 35],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: primaryMat
+      });
+    }
+
+    return { parts };
   }
 
-  function createCylinderMesh(rt, rb, h, mat, x, y, z) {
-    const geo = new THREE.CylinderGeometry(rt, rb, h, 24);
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(x, y, z);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    return mesh;
+  // ==================== [기능 2-1] AI MULTIMODAL API CALLERS ====================
+  async function callAIBlueprintAPI(imageBase64, mimeType, name, W, D, H, shapeKey, userPrompt) {
+    const provider = state.aiConfig.provider;
+
+    const systemInstruction = `너는 3D 공간 그래픽스 엔지니어다. 사용자가 업로드한 가구 이미지와 전체 규격(가로 W, 세로 D, 높이 H mm)을 분석하여, Three.js에서 이 가구를 가장 사실적이고 입체적으로 조립할 수 있도록 하위 부품(Parts)들의 배열로 분해한 순수 JSON 데이터를 반환해라. 절대 이미지를 평면에 텍스처로 붙이지 말고, 상판(원기둥/직육면체), 다리(개수, 기울기 각도, 원뿔대/원기둥 여부), 등받이, 팔걸이, 서랍, 프레임 등 최소 4개~12개의 세부 파츠로 쪼개어 설계해라.
+각 파츠(parts 배열)는 다음 속성을 가진다:
+- name: 부위 이름 (예: tabletop, leg_1, leg_2, backrest, armrest_l)
+- shape: 'box' | 'cylinder' | 'sphere' | 'rounded_box'
+- size: [width, height, depth] (단위: mm, 'cylinder'일 경우 [radiusTop, radiusBottom, height])
+- position: [x, y, z] (가구 중심 바닥 기준 상대 좌표, 단위: mm)
+- rotation: [rx, ry, rz] (단위: 도, 비스듬히 뻗은 다리 등을 표현할 때 적극 활용)
+- color: 이미지의 해당 부위에서 추출한 실제 Hex 색상 코드 (예: '#C89D7C')
+- materialType: 'wood' | 'metal' | 'fabric' | 'glass' | 'plastic'
+오직 파싱 가능한 순수 JSON 객체 { "parts": [...] } 만 응답해라.`;
+
+    const userTextPrompt = `가구 이름: ${name}
+규격: 가로(W) ${W}mm x 깊이(D) ${D}mm x 높이(H) ${H}mm
+기본 형태 스타일: ${shapeKey}
+사용자 추가 지시사항: ${userPrompt || '이미지의 형태적 특성과 비율, 다리의 기울기 각도를 최대한 반영해 입체적으로 분해해 줘.'}`;
+
+    if (provider === 'gemini') {
+      const apiKey = state.aiConfig.geminiApiKey?.trim();
+      if (!apiKey) throw new Error('Gemini API 키가 입력되지 않았습니다. [키 저장] 후 다시 시도하세요.');
+
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+      const payload = {
+        contents: [
+          {
+            parts: [
+              { text: systemInstruction + '\n\n' + userTextPrompt },
+              ...(imageBase64 ? [{
+                inline_data: {
+                  mime_type: mimeType || 'image/jpeg',
+                  data: imageBase64
+                }
+              }] : [])
+            ]
+          }
+        ],
+        generationConfig: {
+          response_mime_type: 'application/json'
+        }
+      };
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Gemini API Error (${res.status}): ${errText}`);
+      }
+      const data = await res.json();
+      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      return extractJsonFromAiResponse(rawText);
+    } else if (provider === 'openai') {
+      const apiKey = state.aiConfig.openaiApiKey?.trim();
+      if (!apiKey) throw new Error('OpenAI API 키가 입력되지 않았습니다. [키 저장] 후 다시 시도하세요.');
+
+      const endpoint = 'https://api.openai.com/v1/chat/completions';
+      const contentParts = [
+        { type: 'text', text: userTextPrompt }
+      ];
+      if (imageBase64) {
+        contentParts.push({
+          type: 'image_url',
+          image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${imageBase64}` }
+        });
+      }
+
+      const payload = {
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: contentParts }
+        ],
+        response_format: { type: 'json_object' }
+      };
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`OpenAI API Error (${res.status}): ${errText}`);
+      }
+      const data = await res.json();
+      const rawText = data?.choices?.[0]?.message?.content;
+      return extractJsonFromAiResponse(rawText);
+    } else if (provider === 'ollama') {
+      const url = state.aiConfig.ollamaUrl || 'http://localhost:11434/api/generate';
+      const model = state.aiConfig.ollamaModel || 'llama3.2-vision';
+
+      const payload = {
+        model,
+        prompt: systemInstruction + '\n\n' + userTextPrompt,
+        stream: false,
+        format: 'json',
+        ...(imageBase64 ? { images: [imageBase64] } : {})
+      };
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        throw new Error(`Ollama Server Error (${res.status}). 로컬 서버가 실행 중인지 확인하세요.`);
+      }
+      const data = await res.json();
+      const rawText = data?.response || data?.message?.content;
+      return extractJsonFromAiResponse(rawText);
+    } else {
+      return null;
+    }
   }
 
-  function addFourCornerLegs(parent, spanW, spanD, legH, legSize, mat) {
-    const hw = spanW / 2 - legSize / 2;
-    const hd = spanD / 2 - legSize / 2;
-    const coords = [
-      [-hw, -hd],
-      [hw,  -hd],
-      [hw,  hd],
-      [-hw, hd]
-    ];
-    coords.forEach(([lx, lz]) => {
-      const leg = createBoxMesh(legSize, legH, legSize, mat, lx, legH / 2, lz);
-      parent.add(leg);
-    });
+  // FIX 1: Robust JSON extractor capable of parsing JSON embedded in conversational text
+  function extractJsonFromAiResponse(rawText) {
+    if (!rawText) return null;
+    let text = rawText.trim();
+
+    // 1. Try direct parse
+    try {
+      return JSON.parse(text);
+    } catch (_) {}
+
+    // 2. Try codeblock extraction
+    const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (codeBlockMatch && codeBlockMatch[1]) {
+      try {
+        return JSON.parse(codeBlockMatch[1].trim());
+      } catch (_) {}
+    }
+
+    // 3. Match outermost { ... }
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      try {
+        const jsonStr = text.substring(firstBrace, lastBrace + 1);
+        return JSON.parse(jsonStr);
+      } catch (_) {}
+    }
+
+    return null;
   }
 
-  // ==================== FURNITURE CRUD & PLACEMENT ====================
+  // ==================== [기능 3-2] 외부 .GLB/.GLTF 직접 로드 & 캐싱 ====================
+  function handleGLBUpload(file, targetW, targetD, targetH, name) {
+    if (!file) return;
+    const reader = new FileReader();
+
+    showToast(`'${file.name}' GLB 모델을 파싱 및 스케일 변환 중...`);
+
+    reader.onload = (e) => {
+      const arrayBuffer = e.target.result;
+      if (typeof THREE.GLTFLoader === 'undefined') {
+        showToast('GLTFLoader 라이브러리를 불러오지 못했습니다.');
+        return;
+      }
+
+      const loader = new THREE.GLTFLoader();
+      loader.parse(
+        arrayBuffer,
+        '',
+        (gltf) => {
+          const model = gltf.scene;
+          model.name = 'VisualMeshes';
+
+          model.updateMatrixWorld(true);
+          const origBox = new THREE.Box3().setFromObject(model);
+          const origSize = origBox.getSize(new THREE.Vector3());
+          const origCenter = origBox.getCenter(new THREE.Vector3());
+
+          const targetWU = targetW * MM_TO_UNIT;
+          const targetDU = targetD * MM_TO_UNIT;
+          const targetHU = targetH * MM_TO_UNIT;
+
+          const sx = origSize.x > 0.001 ? targetWU / origSize.x : 1;
+          const sy = origSize.y > 0.001 ? targetHU / origSize.y : 1;
+          const sz = origSize.z > 0.001 ? targetDU / origSize.z : 1;
+
+          model.position.x = -origCenter.x * sx;
+          model.position.y = -origBox.min.y * sy;
+          model.position.z = -origCenter.z * sz;
+          model.scale.set(sx, sy, sz);
+
+          model.traverse((child) => {
+            if (child.isMesh) {
+              child.castShadow = true;
+              child.receiveShadow = true;
+            }
+          });
+
+          const id = 'glb_' + Date.now();
+          const itemData = {
+            id,
+            catalogId: id,
+            name: name || file.name.replace(/\.[^/.]+$/, ''),
+            category: 'decor',
+            shape: 'glb_custom',
+            w: targetW,
+            d: targetD,
+            h: targetH,
+            x: 0, y: 0, z: 0,
+            rotY: 0,
+            isGLB: true,
+            isAI: true,
+            tag: 'GLB 3D',
+            origCenter: { x: origCenter.x, y: origBox.min.y, z: origCenter.z },
+            origSize: { x: origSize.x, y: origSize.y, z: origSize.z }
+          };
+
+          // Cache GLB original model in memory
+          state.glbModelCache.set(id, gltf.scene.clone());
+
+          const group = buildGLBFurnitureGroup(gltf.scene, itemData);
+          state.furnitureList.push(itemData);
+          furnitureGroup.add(group);
+          furnitureMeshMap.set(id, group);
+
+          state.aiVault.unshift(itemData);
+          renderAIVaultUI();
+
+          if (state.mode !== '3d') switchViewportMode('3d');
+          selectFurniture(id);
+          evaluateAllCollisions();
+          draw2DFloorplan();
+          showToast(`'${itemData.name}' .GLB 3D 가구가 방 중앙에 성공적으로 배치되었습니다!`);
+        },
+        (err) => {
+          console.error(err);
+          showToast('GLB 파일 로드 중 오류가 발생했습니다.');
+        }
+      );
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // FIX 5: Proper GLB Group Builder with outline and collision shells
+  function buildGLBFurnitureGroup(modelScene, itemData) {
+    const group = new THREE.Group();
+    group.name = 'Furniture_' + itemData.id;
+    group.userData = { furnitureId: itemData.id, itemData };
+
+    const visualNode = modelScene.clone();
+    visualNode.name = 'VisualMeshes';
+    group.add(visualNode);
+
+    const targetWU = itemData.w * MM_TO_UNIT;
+    const targetDU = itemData.d * MM_TO_UNIT;
+    const targetHU = itemData.h * MM_TO_UNIT;
+
+    const boundGeo = new THREE.BoxGeometry(targetWU + 0.02, targetHU + 0.02, targetDU + 0.02);
+    boundGeo.translate(0, targetHU / 2, 0);
+
+    const outlineBox = new THREE.LineSegments(
+      new THREE.EdgesGeometry(boundGeo),
+      new THREE.LineBasicMaterial({ color: 0x4F46E5, linewidth: 2, transparent: true, opacity: 0.0 })
+    );
+    outlineBox.name = 'SelectionOutline';
+    group.add(outlineBox);
+
+    const tintBox = new THREE.Mesh(
+      boundGeo,
+      new THREE.MeshBasicMaterial({ color: 0xEF4444, transparent: true, opacity: 0.0, depthWrite: false })
+    );
+    tintBox.name = 'CollisionShell';
+    group.add(tintBox);
+
+    // Ergonomic Zone
+    const ergoGeo = new THREE.PlaneGeometry(targetWU + 0.4, targetDU + 0.5);
+    ergoGeo.rotateX(-Math.PI / 2);
+    ergoGeo.translate(0, 0.005, 0.25);
+    const ergoPlane = new THREE.Mesh(
+      ergoGeo,
+      new THREE.MeshBasicMaterial({ color: 0x10B981, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false })
+    );
+    ergoPlane.name = 'ErgoZoneMesh';
+    ergoPlane.visible = state.globalErgoVisible;
+    group.add(ergoPlane);
+
+    group.position.set(itemData.x * MM_TO_UNIT, (itemData.y || 0) * MM_TO_UNIT, itemData.z * MM_TO_UNIT);
+    group.rotation.y = THREE.MathUtils.degToRad(itemData.rotY || 0);
+    return group;
+  }
+
+  // ==================== [기능 3] 중앙 색상 추출 (배경 제외) ====================
+  function handleAIImageUpload(file) {
+    if (!file || !file.type.startsWith('image/')) return;
+    state.aiUploadedMimeType = file.type;
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target.result;
+      state.aiUploadedBase64 = dataUrl.split(',')[1];
+
+      const img = new Image();
+      img.onload = () => {
+        const c = document.createElement('canvas');
+        c.width = 128;
+        c.height = 128;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0, 128, 128);
+
+        const imgData = ctx.getImageData(32, 32, 64, 64).data;
+        let rSum = 0, gSum = 0, bSum = 0, validCount = 0;
+
+        for (let i = 0; i < imgData.length; i += 4) {
+          const r = imgData[i];
+          const g = imgData[i + 1];
+          const b = imgData[i + 2];
+          const a = imgData[i + 3];
+
+          if (a < 128) continue;
+          if (r < 32 && g < 32 && b < 32) continue;
+          if (r > 235 && g > 235 && b > 235) continue;
+
+          rSum += r;
+          gSum += g;
+          bSum += b;
+          validCount++;
+        }
+
+        let hex = '#C89D7C';
+        if (validCount > 10) {
+          const r = Math.round(rSum / validCount);
+          const g = Math.round(gSum / validCount);
+          const b = Math.round(bSum / validCount);
+          hex = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+        }
+
+        state.aiExtractedHex = hex;
+        document.getElementById('ai-fallback-color').value = hex;
+        document.getElementById('ai-fallback-color-label').textContent = hex;
+        document.getElementById('ai-extracted-swatch').style.background = hex;
+        document.getElementById('ai-extracted-hex').textContent = `추출 색상: ${hex}`;
+
+        const previewImg = document.getElementById('ai-preview-img');
+        previewImg.src = dataUrl;
+        document.getElementById('ai-dropzone-prompt').classList.add('hidden');
+        document.getElementById('ai-preview-wrap').classList.remove('hidden');
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // ==================== AI BLUEPRINT TRIGGER ====================
+  async function triggerAIFurnitureGeneration() {
+    const name = document.getElementById('ai-furn-name').value.trim() || 'AI 커스텀 가구';
+    const shape = document.getElementById('ai-furn-shape').value;
+    const w = Math.max(200, Number(document.getElementById('ai-dim-w').value) || 650);
+    const d = Math.max(200, Number(document.getElementById('ai-dim-d').value) || 650);
+    const h = Math.max(200, Number(document.getElementById('ai-dim-h').value) || 520);
+    const color = document.getElementById('ai-fallback-color').value || state.aiExtractedHex;
+    const matType = document.getElementById('ai-material-type').value || 'wood';
+    const promptText = document.getElementById('ai-extra-prompt').value.trim();
+
+    const loadingBox = document.getElementById('ai-loading-box');
+    const loadingTitle = document.getElementById('ai-loading-title');
+    const progressBar = document.getElementById('ai-progress-bar');
+    const stepText = document.getElementById('ai-loading-step');
+    const logBox = document.getElementById('ai-blueprint-log');
+    const genBtn = document.getElementById('btn-generate-ai-furniture');
+
+    loadingBox.classList.remove('hidden');
+    logBox.classList.add('hidden');
+    genBtn.disabled = true;
+    progressBar.style.width = '15%';
+    loadingTitle.textContent = 'AI 3D 부품 조합(Blueprint) 설계 중...';
+    stepText.textContent = `엔진: ${state.aiConfig.provider.toUpperCase()} | 이미지/규격 전송 중...`;
+
+    let blueprint = null;
+    let isAIGenerated = false;
+
+    try {
+      if (state.aiConfig.provider !== 'smart_preset') {
+        progressBar.style.width = '45%';
+        stepText.textContent = '멀티모달 Vision 분석 및 Three.js JSON 파츠 분해 중...';
+        blueprint = await callAIBlueprintAPI(
+          state.aiUploadedBase64,
+          state.aiUploadedMimeType,
+          name,
+          w, d, h,
+          shape,
+          promptText
+        );
+        if (blueprint && Array.isArray(blueprint.parts) && blueprint.parts.length > 0) {
+          isAIGenerated = true;
+        }
+      }
+    } catch (err) {
+      console.warn('AI API call failed, falling back to smart procedural generator:', err);
+      showToast(`AI 호출 오류: ${err.message}. 정밀 파라미터 조립기로 자동 전환합니다.`);
+    }
+
+    progressBar.style.width = '80%';
+    stepText.textContent = isAIGenerated
+      ? `AI가 ${blueprint.parts.length}개 세부 파츠 설계도를 완성했습니다! Three.js 조립 중...`
+      : '고급 디테일 파라미터 파츠 생성 알고리즘으로 3D 메쉬를 합성 중...';
+
+    if (!blueprint || !Array.isArray(blueprint.parts) || blueprint.parts.length === 0) {
+      blueprint = generateSmartBlueprint(shape, w, d, h, color, matType);
+    }
+
+    logBox.textContent = `// AI 3D Furniture Blueprint JSON (${isAIGenerated ? 'Online API' : 'Smart Procedural'})\n` + JSON.stringify(blueprint, null, 2);
+    logBox.classList.remove('hidden');
+
+    setTimeout(() => {
+      progressBar.style.width = '100%';
+      loadingBox.classList.add('hidden');
+      genBtn.disabled = false;
+
+      const newItemData = {
+        id: 'ai_' + Date.now(),
+        catalogId: 'ai_' + Date.now(),
+        name,
+        category: 'decor',
+        shape,
+        w, d, h,
+        x: 0, y: 0, z: 0,
+        rotY: 0,
+        color,
+        materialType: matType,
+        blueprintData: blueprint,
+        isAI: true,
+        tag: isAIGenerated ? 'AI Vision' : 'AI Blueprint',
+        ergoClearance: { front: 550, side: 200 }
+      };
+
+      state.furnitureList.push(newItemData);
+      const meshGroup = buildFurnitureFromAIJson(blueprint, newItemData);
+      furnitureGroup.add(meshGroup);
+      furnitureMeshMap.set(newItemData.id, meshGroup);
+
+      state.aiVault.unshift(newItemData);
+      renderAIVaultUI();
+
+      if (state.mode !== '3d') switchViewportMode('3d');
+      selectFurniture(newItemData.id);
+      evaluateAllCollisions();
+      draw2DFloorplan();
+      showToast(`3D 가구 '${name}' 조립 완료 (${blueprint.parts.length}개 파츠 입체 결합)!`);
+    }, 500);
+  }
+
+  // ==================== FURNITURE CRUD & SELECTION ====================
+  // FIX 5: Handle GLB cloning when adding from template/vault
   function addFurnitureFromTemplate(template, customTransform = {}) {
     const id = 'furn_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const isGLB = !!template.isGLB;
+
     const newItem = {
       id,
       catalogId: template.catalogId || id,
       name: template.name,
-      category: template.category,
+      category: template.category || 'decor',
       shape: template.shape || 'legged',
       w: Number(template.w),
       d: Number(template.d),
@@ -1201,41 +2314,123 @@
       z: customTransform.z !== undefined ? customTransform.z : 0,
       rotY: customTransform.rotY !== undefined ? customTransform.rotY : 0,
       color: template.color || '#8B6F4E',
-      textureDataUrl: template.textureDataUrl || null,
-      ergoClearance: template.ergoClearance || { front: 550, side: 200 },
-      ergoVisible: true,
+      materialType: template.materialType || 'wood',
+      isGLB,
       isAI: !!template.isAI,
       isColliding: false,
-      collisionReason: ''
+      collisionReason: '',
+      ergoClearance: template.ergoClearance || { front: 550, side: 200 },
+      ergoVisible: true
     };
 
+    let meshGroup = null;
+
+    if (isGLB) {
+      const cachedScene = state.glbModelCache.get(template.catalogId) || state.glbModelCache.get(template.id);
+      if (cachedScene) {
+        meshGroup = buildGLBFurnitureGroup(cachedScene, newItem);
+      } else {
+        const bp = generateSmartBlueprint('modern_rect_desk', newItem.w, newItem.d, newItem.h, newItem.color, 'wood');
+        newItem.blueprintData = bp;
+        meshGroup = buildFurnitureFromAIJson(bp, newItem);
+      }
+    } else {
+      newItem.blueprintData = template.blueprintData || generateSmartBlueprint(template.shape, template.w, template.d, template.h, template.color, template.materialType);
+      meshGroup = buildFurnitureFromAIJson(newItem.blueprintData, newItem);
+    }
+
     state.furnitureList.push(newItem);
-    const meshGroup = createProceduralFurnitureGroup(newItem);
     furnitureGroup.add(meshGroup);
     furnitureMeshMap.set(id, meshGroup);
 
     selectFurniture(id);
     evaluateAllCollisions();
     draw2DFloorplan();
+    HistoryManager.pushState();
     return newItem;
   }
 
+  // FIX 4: Rebuild without destroying custom AI blueprints or GLB models
   function rebuildSingleFurnitureMesh(item) {
     const oldMesh = furnitureMeshMap.get(item.id);
-    if (oldMesh) {
-      furnitureGroup.remove(oldMesh);
+    if (oldMesh) furnitureGroup.remove(oldMesh);
+
+    let newMesh = null;
+
+    if (item.isGLB) {
+      const cachedScene = state.glbModelCache.get(item.catalogId) || state.glbModelCache.get(item.id);
+      if (cachedScene) {
+        newMesh = buildGLBFurnitureGroup(cachedScene, item);
+      } else {
+        const bp = generateSmartBlueprint('modern_rect_desk', item.w, item.d, item.h, item.color, 'wood');
+        newMesh = buildFurnitureFromAIJson(bp, item);
+      }
+    } else if (item.blueprintData && Array.isArray(item.blueprintData.parts)) {
+      // Scale blueprint parts proportionally to new dimensions
+      const origW = item.blueprintData.origW || item.w;
+      const origD = item.blueprintData.origD || item.d;
+      const origH = item.blueprintData.origH || item.h;
+
+      const sx = origW > 0 ? item.w / origW : 1;
+      const sy = origH > 0 ? item.h / origH : 1;
+      const sz = origD > 0 ? item.d / origD : 1;
+
+      // Update part sizes and positions
+      const scaledBlueprint = {
+        parts: item.blueprintData.parts.map((p) => {
+          const szArr = p.size || [100, 100, 100];
+          const posArr = p.position || [0, 0, 0];
+          return {
+            ...p,
+            size: [szArr[0] * sx, szArr[1] * sy, szArr[2] * sz],
+            position: [posArr[0] * sx, posArr[1] * sy, posArr[2] * sz]
+          };
+        }),
+        origW: item.w,
+        origD: item.d,
+        origH: item.h
+      };
+      item.blueprintData = scaledBlueprint;
+      newMesh = buildFurnitureFromAIJson(scaledBlueprint, item);
+    } else {
+      const blueprint = generateSmartBlueprint(item.shape, item.w, item.d, item.h, item.color, item.materialType);
+      item.blueprintData = blueprint;
+      newMesh = buildFurnitureFromAIJson(blueprint, item);
     }
-    const newMesh = createProceduralFurnitureGroup(item);
+
     furnitureGroup.add(newMesh);
     furnitureMeshMap.set(item.id, newMesh);
     updateFurnitureVisualStatus(item);
   }
 
+  // FIX 4b: Fast Material Color Update without destroying 3D mesh
+  function updateFurnitureMaterialColor(item, newColor) {
+    item.color = newColor;
+    const group = furnitureMeshMap.get(item.id);
+    if (!group) return;
+
+    const visualNode = group.getObjectByName('VisualMeshes');
+    if (visualNode) {
+      visualNode.traverse((child) => {
+        if (child.isMesh && child.material) {
+          // If material is primary, update color
+          if (child.material.color) {
+            child.material.color.set(newColor);
+          }
+        }
+      });
+    }
+  }
+
   function selectFurniture(id) {
     state.selectedFurnitureId = id;
-    state.furnitureList.forEach((item) => {
-      updateFurnitureVisualStatus(item);
-    });
+    if (id) {
+      state.selectedWallId = null;
+      if (state.deviceMode === 'mobile') {
+        openMobileDrawer('right');
+      }
+    }
+    state.furnitureList.forEach((item) => updateFurnitureVisualStatus(item));
     updateInspectorUI();
     draw2DFloorplan();
   }
@@ -1257,11 +2452,11 @@
     evaluateAllCollisions();
     updateInspectorUI();
     draw2DFloorplan();
+    HistoryManager.pushState();
   }
 
-  // ==================== [기능 2-3] 충돌 감지 및 생활과학 동선(방문 900mm 반경) 체크 ====================
+  // ==================== [기능 2-3] 충돌 감지 & 900mm 방문 반경 체크 ====================
   function evaluateAllCollisions() {
-    // Compute oriented bounding boxes (approximated as world AABB of the VisualMeshes group)
     const itemBoxes = new Map();
 
     state.furnitureList.forEach((item) => {
@@ -1270,7 +2465,6 @@
       group.updateMatrixWorld(true);
       const visualNode = group.getObjectByName('VisualMeshes') || group;
       const box3 = new THREE.Box3().setFromObject(visualNode);
-      // Slight inward tolerance (8mm) so flush-against-wall placement is allowed without false positive
       box3.expandByScalar(-0.008);
       itemBoxes.set(item.id, box3);
 
@@ -1278,7 +2472,7 @@
       item.collisionReason = '';
     });
 
-    // 1. Check Furniture vs Furniture AABB Collision
+    // 1. Furniture vs Furniture Collision
     for (let i = 0; i < state.furnitureList.length; i++) {
       for (let j = i + 1; j < state.furnitureList.length; j++) {
         const a = state.furnitureList[i];
@@ -1294,13 +2488,12 @@
       }
     }
 
-    // 2. Check Furniture vs Walls & Outside Floor Boundary
+    // 2. Furniture vs Walls & Floor Boundary
     const poly = getEffectiveFloorPolygon();
     state.furnitureList.forEach((item) => {
       const box = itemBoxes.get(item.id);
       if (!box) return;
 
-      // Check 4 bottom corners of furniture AABB against floor polygon
       const cornersMM = [
         { x: box.min.x * UNIT_TO_MM, z: box.min.z * UNIT_TO_MM },
         { x: box.max.x * UNIT_TO_MM, z: box.min.z * UNIT_TO_MM },
@@ -1316,7 +2509,6 @@
         }
       }
 
-      // Check against each wall segment thickness
       for (const wall of state.walls) {
         const halfThick = (wall.thickness || state.wallThickness) / 2 - 12;
         if (boxIntersectsWallSegmentMM(box, wall, halfThick)) {
@@ -1326,10 +2518,9 @@
         }
       }
 
-      // 3. Check Furniture vs 900mm Door Opening Swing Radius
+      // 3. Furniture vs 900mm Door Swing Zone
       for (const doorZone of doorSwingZones) {
         if (box.intersectsBox(doorZone.box3)) {
-          // Refine with 2D circle-AABB check on XZ plane (radius = 0.88m)
           const cx = doorZone.center.x;
           const cz = doorZone.center.z;
           const closestX = Math.max(box.min.x, Math.min(cx, box.max.x));
@@ -1346,7 +2537,6 @@
       updateFurnitureVisualStatus(item);
     });
 
-    // Update HUD Banner
     const collidingItems = state.furnitureList.filter((f) => f.isColliding);
     const hudBanner = document.getElementById('hud-collision-banner');
     const hudText = document.getElementById('hud-collision-text');
@@ -1362,9 +2552,7 @@
     }
 
     renderPlacedFurnitureListUI();
-    if (state.selectedFurnitureId) {
-      updateSelectedCollisionUI();
-    }
+    if (state.selectedFurnitureId) updateSelectedCollisionUI();
   }
 
   function updateFurnitureVisualStatus(item) {
@@ -1379,10 +2567,10 @@
 
     if (outline) {
       if (item.isColliding) {
-        outline.material.color.setHex(0xEF4444); // Red warning
+        outline.material.color.setHex(0xEF4444);
         outline.material.opacity = 1.0;
       } else if (isSelected) {
-        outline.material.color.setHex(0x4F46E5); // Indigo active
+        outline.material.color.setHex(0x4F46E5);
         outline.material.opacity = 1.0;
       } else {
         outline.material.opacity = 0.0;
@@ -1398,9 +2586,7 @@
       ergoMesh.visible = showErgo;
       ergoMesh.material.color.setHex(item.isColliding ? 0xEF4444 : 0x10B981);
     }
-    if (ergoLine) {
-      ergoLine.visible = showErgo;
-    }
+    if (ergoLine) ergoLine.visible = showErgo;
   }
 
   function isPointInPolygon2D(pt, poly) {
@@ -1421,7 +2607,6 @@
     const minZ = box.min.z * UNIT_TO_MM;
     const maxZ = box.max.z * UNIT_TO_MM;
 
-    // Sample points along the wall segment
     const steps = 10;
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
@@ -1439,9 +2624,22 @@
     return false;
   }
 
+  // FIX 2: Point to Line Segment Distance for accurate wall erasing
+  function distToSegment(px, pz, x1, z1, x2, z2) {
+    const dx = x2 - x1;
+    const dz = z2 - z1;
+    const lenSq = dx * dx + dz * dz;
+    if (lenSq === 0) return Math.hypot(px - x1, pz - z1);
+    const t = Math.max(0, Math.min(1, ((px - x1) * dx + (pz - z1) * dz) / lenSq));
+    const projX = x1 + t * dx;
+    const projZ = z1 + t * dz;
+    return Math.hypot(px - projX, pz - projZ);
+  }
+
   // ==================== 3D RAYCASTER DRAG & DROP ====================
   function on3DPointerDown(e) {
-    if (state.mode !== '3d' || e.button !== 0) return;
+    if (state.mode !== '3d') return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
 
     const rect = renderer.domElement.getBoundingClientRect();
     mouseNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1451,7 +2649,6 @@
     const hitList = raycaster.intersectObjects(furnitureGroup.children, true);
 
     if (hitList.length > 0) {
-      // Find top-level furniture group
       let node = hitList[0].object;
       while (node && node.parent !== furnitureGroup) {
         node = node.parent;
@@ -1472,8 +2669,10 @@
         return;
       }
     } else {
-      // Clicked empty space -> deselect
       selectFurniture(null);
+      if (state.deviceMode === 'mobile') {
+        closeMobileDrawers();
+      }
     }
   }
 
@@ -1515,26 +2714,60 @@
       isDragging3D = false;
       dragged3DObject = null;
       controls.enabled = true;
+      evaluateAllCollisions();
       draw2DFloorplan();
+      HistoryManager.pushState();
     }
   }
 
   function onGlobalKeyDown(e) {
-    // Ignore when typing inside an input
-    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return;
+    const isInputFocused = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+
+    // Undo / Redo Shortcuts
+    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+    const isCtrlOrCmd = isMac ? e.metaKey : e.ctrlKey;
+
+    if (isCtrlOrCmd) {
+      if (!isInputFocused) {
+        if ((e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+          e.preventDefault();
+          HistoryManager.undo();
+          return;
+        }
+        if ((e.key === 'y' || e.key === 'Y') || ((e.key === 'z' || e.key === 'Z') && e.shiftKey)) {
+          e.preventDefault();
+          HistoryManager.redo();
+          return;
+        }
+      }
+    }
+
+    if (isInputFocused) return;
 
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (state.selectedFurnitureId) {
         deleteSelectedFurniture();
+      } else if (state.selectedWallId) {
+        deleteSelectedWall();
       }
     } else if (e.key === 'r' || e.key === 'R') {
-      if (state.selectedFurnitureId) {
-        rotateSelectedFurnitureBy(90);
+      if (state.selectedFurnitureId) rotateSelectedFurnitureBy(90);
+    } else if (e.key === 'Escape') {
+      if (state.isDrawingWall) {
+        state.isDrawingWall = false;
+        state.drawStartPt = null;
+        state.drawCurrentPt = null;
+        draw2DFloorplan();
+        showToast('벽 그리기가 취소되었습니다.');
+      } else if (state.selectedFurnitureId) {
+        selectFurniture(null);
+      } else if (state.selectedWallId) {
+        selectWall(null);
       }
     }
   }
 
-  // ==================== FRONT WALL CUTAWAY IN 3D VIEW ====================
+  // ==================== FRONT WALL CUTAWAY ====================
   function updateFrontWallCutaway() {
     if (!wallMeshes.length) return;
     const camDir = new THREE.Vector3();
@@ -1549,11 +2782,9 @@
         return;
       }
 
-      // Vector from wall midpoint to camera
       camDir.copy(camera.position).sub(wallGroup.userData.midPoint).normalize();
       const dot = camDir.dot(wallGroup.userData.outwardNormal);
 
-      // If camera is looking from the outside of this exterior wall inward, make it low & translucent
       if (dot > 0.22) {
         mat.opacity = 0.18;
         wallGroup.scale.y = 0.22;
@@ -1574,9 +2805,11 @@
     canvas2D.height = container.clientHeight;
 
     canvas2D.addEventListener('pointerdown', on2DPointerDown);
-    canvas2D.addEventListener('pointermove', on2DPointerMove);
+    window.addEventListener('pointermove', on2DPointerMove);
     window.addEventListener('pointerup', on2DPointerUp);
+    window.addEventListener('pointercancel', on2DPointerUp);
     canvas2D.addEventListener('wheel', on2DWheel, { passive: false });
+    canvas2D.addEventListener('contextmenu', (e) => e.preventDefault());
   }
 
   function mmToCanvas2D(xMM, zMM) {
@@ -1609,7 +2842,7 @@
     ctx2D.fillStyle = '#121316';
     ctx2D.fillRect(0, 0, W, H);
 
-    // 1. Draw CAD Grid (100mm minor, 500mm major)
+    // 1. Grid
     const stepMinor = 100 * state.zoom2D;
     const stepMajor = 500 * state.zoom2D;
     const cx = W / 2 + state.pan2D.x;
@@ -1639,7 +2872,7 @@
     }
     ctx2D.stroke();
 
-    // 2. Draw Floor Polygon Fill
+    // 2. Floor Polygon
     const poly = getEffectiveFloorPolygon();
     if (poly.length >= 3) {
       ctx2D.fillStyle = '#1C1E24';
@@ -1653,7 +2886,7 @@
       ctx2D.fill();
     }
 
-    // 3. Draw Furniture Footprint Boxes & Ergonomic Zones in 2D
+    // 3. Furniture Footprints in 2D
     state.furnitureList.forEach((item) => {
       const center = mmToCanvas2D(item.x, item.z);
       const pw = item.w * state.zoom2D;
@@ -1663,7 +2896,6 @@
       ctx2D.translate(center.px, center.py);
       ctx2D.rotate(THREE.MathUtils.degToRad(-item.rotY));
 
-      // Ergonomic zone in 2D
       if (state.globalErgoVisible && item.ergoVisible !== false) {
         const frontC = (item.ergoClearance?.front || 550) * state.zoom2D;
         const sideC = (item.ergoClearance?.side || 200) * state.zoom2D;
@@ -1676,29 +2908,40 @@
         ctx2D.setLineDash([]);
       }
 
-      // Furniture Box
       ctx2D.fillStyle = item.isColliding ? 'rgba(239, 68, 68, 0.45)' : (item.color || '#4B5563');
       ctx2D.strokeStyle = item.id === state.selectedFurnitureId ? '#4F46E5' : (item.isColliding ? '#EF4444' : '#E2E4E9');
       ctx2D.lineWidth = item.id === state.selectedFurnitureId ? 2.5 : 1.2;
       ctx2D.fillRect(-pw / 2, -pd / 2, pw, pd);
       ctx2D.strokeRect(-pw / 2, -pd / 2, pw, pd);
 
-      // Label
       ctx2D.fillStyle = '#FFFFFF';
       ctx2D.font = '600 11px Inter, sans-serif';
       ctx2D.textAlign = 'center';
       ctx2D.textBaseline = 'middle';
-      ctx2D.fillText(item.name.slice(0, 10), 0, 0);
+      ctx2D.fillText(item.name.slice(0, 11), 0, 0);
       ctx2D.restore();
     });
 
-    // 4. Draw Walls & Dimension Labels
+    // 4. Walls & Dimensions (with selection highlight and hover glow)
     state.walls.forEach((wall) => {
       const p1 = mmToCanvas2D(wall.x1, wall.z1);
       const p2 = mmToCanvas2D(wall.x2, wall.z2);
       const thickPx = Math.max(6, (wall.thickness || state.wallThickness) * state.zoom2D);
 
-      ctx2D.strokeStyle = '#9CA3AF';
+      const isSelected = wall.id === state.selectedWallId;
+      const isHovered = wall.id === state.hoveredWallId;
+
+      if (isSelected) {
+        ctx2D.strokeStyle = 'rgba(99, 102, 241, 0.45)';
+        ctx2D.lineWidth = thickPx + 8;
+        ctx2D.lineCap = 'round';
+        ctx2D.beginPath();
+        ctx2D.moveTo(p1.px, p1.py);
+        ctx2D.lineTo(p2.px, p2.py);
+        ctx2D.stroke();
+      }
+
+      ctx2D.strokeStyle = isSelected ? '#6366F1' : (isHovered ? '#818CF8' : '#9CA3AF');
       ctx2D.lineWidth = thickPx;
       ctx2D.lineCap = 'square';
       ctx2D.beginPath();
@@ -1706,23 +2949,69 @@
       ctx2D.lineTo(p2.px, p2.py);
       ctx2D.stroke();
 
-      // Dimension label in mm
       const lenMM = Math.round(Math.hypot(wall.x2 - wall.x1, wall.z2 - wall.z1));
       const midX = (p1.px + p2.px) / 2;
       const midY = (p1.py + p2.py) / 2;
-      ctx2D.fillStyle = '#18191C';
-      ctx2D.fillRect(midX - 28, midY - 9, 56, 18);
-      ctx2D.strokeStyle = '#3F4352';
-      ctx2D.lineWidth = 1;
-      ctx2D.strokeRect(midX - 28, midY - 9, 56, 18);
-      ctx2D.fillStyle = '#E2E4E9';
-      ctx2D.font = '500 10.5px "JetBrains Mono", monospace';
+      ctx2D.fillStyle = isSelected ? '#1E1B4B' : '#18191C';
+      ctx2D.fillRect(midX - 30, midY - 10, 60, 20);
+      ctx2D.strokeStyle = isSelected ? '#818CF8' : '#3F4352';
+      ctx2D.lineWidth = isSelected ? 1.5 : 1;
+      ctx2D.strokeRect(midX - 30, midY - 10, 60, 20);
+      ctx2D.fillStyle = isSelected ? '#C7D2FE' : '#E2E4E9';
+      ctx2D.font = '600 10.5px "JetBrains Mono", monospace';
       ctx2D.textAlign = 'center';
       ctx2D.textBaseline = 'middle';
       ctx2D.fillText(`${lenMM}mm`, midX, midY);
     });
 
-    // 5. Draw Doors (with 900mm swing arc) & Windows on Walls
+    // 4b. Circular Vertex Handles (Active in Select Mode)
+    if (state.drawTool === 'select') {
+      const drawnVerts = new Set();
+      state.walls.forEach((wall) => {
+        ['start', 'end'].forEach((ep) => {
+          const wx = ep === 'start' ? wall.x1 : wall.x2;
+          const wz = ep === 'start' ? wall.z1 : wall.z2;
+          const key = `${Math.round(wx)},${Math.round(wz)}`;
+          if (drawnVerts.has(key)) return;
+          drawnVerts.add(key);
+
+          const cp = mmToCanvas2D(wx, wz);
+          const isHovered = state.hoveredVertex && Math.hypot(state.hoveredVertex.x - wx, state.hoveredVertex.z - wz) < 50;
+          const isDragging = state.draggingVertex && Math.hypot(state.draggingVertex.origX - wx, state.draggingVertex.origZ - wz) < 50;
+
+          const radius = isDragging ? 8.5 : (isHovered ? 7.5 : 5.5);
+          ctx2D.beginPath();
+          ctx2D.arc(cp.px, cp.py, radius, 0, Math.PI * 2);
+          ctx2D.fillStyle = isDragging ? '#4F46E5' : (isHovered ? '#818CF8' : '#1E1F24');
+          ctx2D.fill();
+          ctx2D.strokeStyle = isDragging || isHovered ? '#FFFFFF' : '#818CF8';
+          ctx2D.lineWidth = isDragging || isHovered ? 2.5 : 1.8;
+          ctx2D.stroke();
+        });
+      });
+    }
+
+    // 4c. Ortho Alignment Guide Line
+    if (state.orthoGuideLine) {
+      ctx2D.save();
+      ctx2D.strokeStyle = '#38BDF8';
+      ctx2D.lineWidth = 1.2;
+      ctx2D.setLineDash([6, 4]);
+      ctx2D.beginPath();
+      if (state.orthoGuideLine.type === 'vertical') {
+        const p = mmToCanvas2D(state.orthoGuideLine.x, 0);
+        ctx2D.moveTo(p.px, 0);
+        ctx2D.lineTo(p.px, H);
+      } else if (state.orthoGuideLine.type === 'horizontal') {
+        const p = mmToCanvas2D(0, state.orthoGuideLine.z);
+        ctx2D.moveTo(0, p.py);
+        ctx2D.lineTo(W, p.py);
+      }
+      ctx2D.stroke();
+      ctx2D.restore();
+    }
+
+    // 5. Doors with 900mm swing and Windows
     state.openings.forEach((op) => {
       const wall = state.walls.find((w) => w.id === op.wallId);
       if (!wall) return;
@@ -1738,13 +3027,11 @@
       ctx2D.translate(center.px, center.py);
       ctx2D.rotate(angle);
 
-      // Clear wall gap
       ctx2D.fillStyle = '#121316';
       ctx2D.fillRect(-widthPx / 2, -thickPx / 2, widthPx, thickPx);
 
       if (op.type === 'door') {
         const rPx = 900 * state.zoom2D;
-        // 900mm Door Swing Sector
         ctx2D.fillStyle = 'rgba(79, 70, 229, 0.22)';
         ctx2D.strokeStyle = '#818CF8';
         ctx2D.lineWidth = 1.5;
@@ -1755,21 +3042,18 @@
         ctx2D.fill();
         ctx2D.stroke();
 
-        // Label 900mm
         ctx2D.fillStyle = '#A5B4FC';
         ctx2D.font = '500 10px "JetBrains Mono", monospace';
         ctx2D.fillText('R900', -widthPx / 2 + rPx * 0.45, rPx * 0.45);
       } else {
-        // Window symbol (double pane cyan line)
         ctx2D.strokeStyle = '#38BDF8';
         ctx2D.lineWidth = 2;
         ctx2D.strokeRect(-widthPx / 2, -thickPx / 3, widthPx, (thickPx * 2) / 3);
       }
-
       ctx2D.restore();
     });
 
-    // 6. Active Wall Drawing Preview Line
+    // 6. Active Wall Line
     if (state.isDrawingWall && state.drawStartPt && state.drawCurrentPt) {
       const p1 = mmToCanvas2D(state.drawStartPt.x, state.drawStartPt.z);
       const p2 = mmToCanvas2D(state.drawCurrentPt.x, state.drawCurrentPt.z);
@@ -1790,11 +3074,50 @@
     }
   }
 
+  const activePointers2D = new Map();
+  let pinchStartDist = 0;
+  let pinchStartZoom = 0.11;
+  let pinchStartMid = { x: 0, y: 0 };
+  let pinchStartPan = { x: 0, y: 0 };
+  let isPinching2D = false;
+
+  // 2D Panning, Drawing, Multi-Touch Pinch/Pan, Wall/Vertex/Furniture Dragging & Selection
   function on2DPointerDown(e) {
     if (state.mode !== '2d') return;
+    activePointers2D.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // Multi-touch pinch & two-finger pan handling
+    if (activePointers2D.size === 2) {
+      isPinching2D = true;
+      state.isPanning2D = false;
+      state.isDrawingWall = false;
+      state.draggingVertex = null;
+      state.draggingWall = null;
+      state.dragging2DFurnitureId = null;
+      state.drag2DMode = null;
+
+      const pts = Array.from(activePointers2D.values());
+      pinchStartDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      pinchStartZoom = state.zoom2D;
+      pinchStartMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      pinchStartPan = { x: state.pan2D.x, y: state.pan2D.y };
+      draw2DFloorplan();
+      return;
+    }
+
+    if (activePointers2D.size > 2) return;
     const rect = canvas2D.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
+
+    // Right-click, middle-click or dedicated Pan tool -> start pan
+    if (e.button === 2 || e.button === 1 || state.drawTool === 'pan') {
+      state.isPanning2D = true;
+      state.panStart2D = { x: e.clientX - state.pan2D.x, y: e.clientY - state.pan2D.y };
+      return;
+    }
+
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
 
     if (state.drawTool === 'wall') {
       state.isDrawingWall = true;
@@ -1808,7 +3131,29 @@
       const clickMM = canvas2DToMM(px, py, 10);
       erase2DElementNear(clickMM);
     } else {
-      // 'select' tool -> select and drag furniture in 2D
+      // Tool: 'select'
+      const isMobileTouch = state.deviceMode === 'mobile' || (e.pointerType === 'touch') || ('ontouchstart' in window);
+      const vertHitRadius = isMobileTouch ? 26 : 14;
+      const wallHitDist = isMobileTouch ? 360 : 220;
+
+      // 1. Check Vertex handles first
+      const hitVertex = findVertexNearCanvasPoint(px, py, vertHitRadius);
+      if (hitVertex) {
+        selectWall(hitVertex.wallId);
+        const conns = getConnectedWallEndpoints(hitVertex.x, hitVertex.z);
+        state.draggingVertex = {
+          origX: hitVertex.x,
+          origZ: hitVertex.z,
+          connections: conns,
+          startMouseMM: canvas2DToMM(px, py, 1)
+        };
+        state.drag2DMode = 'vertex';
+        state.hasDragged2D = false;
+        draw2DFloorplan();
+        return;
+      }
+
+      // 2. Check Furniture
       const clickMM = canvas2DToMM(px, py, 1);
       const hitFurn = findFurnitureAt2DPoint(clickMM.x, clickMM.z);
       if (hitFurn) {
@@ -1818,14 +3163,72 @@
           x: hitFurn.x - clickMM.x,
           z: hitFurn.z - clickMM.z
         };
-      } else {
-        selectFurniture(null);
+        state.drag2DMode = 'furniture';
+        state.hasDragged2D = false;
+        draw2DFloorplan();
+        return;
+      }
+
+      // 3. Check Wall segment
+      const hitWall = findWallNearPoint(clickMM, wallHitDist);
+      if (hitWall) {
+        selectWall(hitWall.id);
+        const origStart = { x: hitWall.x1, z: hitWall.z1 };
+        const origEnd = { x: hitWall.x2, z: hitWall.z2 };
+        const startConns = getConnectedWallEndpoints(origStart.x, origStart.z).filter((c) => c.wall.id !== hitWall.id);
+        const endConns = getConnectedWallEndpoints(origEnd.x, origEnd.z).filter((c) => c.wall.id !== hitWall.id);
+        state.draggingWall = {
+          wall: hitWall,
+          origStart,
+          origEnd,
+          startConns,
+          endConns,
+          startMouseMM: clickMM
+        };
+        state.drag2DMode = 'wall';
+        state.hasDragged2D = false;
+        draw2DFloorplan();
+        return;
+      }
+
+      // 4. Clicked empty canvas -> deselect all & close drawers on mobile
+      selectFurniture(null);
+      selectWall(null);
+      if (state.deviceMode === 'mobile') {
+        closeMobileDrawers();
       }
     }
   }
 
   function on2DPointerMove(e) {
     if (state.mode !== '2d') return;
+
+    if (activePointers2D.has(e.pointerId)) {
+      activePointers2D.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+
+    // Two-finger pinch-to-zoom & two-finger pan
+    if (isPinching2D && activePointers2D.size >= 2) {
+      const pts = Array.from(activePointers2D.values());
+      const curDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      if (pinchStartDist > 5) {
+        const factor = curDist / pinchStartDist;
+        state.zoom2D = Math.min(0.4, Math.max(0.025, pinchStartZoom * factor));
+      }
+      const curMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      state.pan2D.x = pinchStartPan.x + (curMid.x - pinchStartMid.x);
+      state.pan2D.y = pinchStartPan.y + (curMid.y - pinchStartMid.y);
+      draw2DFloorplan();
+      return;
+    }
+
+    if (state.isPanning2D) {
+      state.pan2D.x = e.clientX - state.panStart2D.x;
+      state.pan2D.y = e.clientY - state.panStart2D.y;
+      draw2DFloorplan();
+      return;
+    }
+
     const rect = canvas2D.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
@@ -1833,7 +3236,98 @@
     if (state.isDrawingWall) {
       state.drawCurrentPt = canvas2DToMM(px, py, 100);
       draw2DFloorplan();
-    } else if (state.dragging2DFurnitureId) {
+      return;
+    }
+
+    if (state.drag2DMode === 'vertex' && state.draggingVertex) {
+      state.hasDragged2D = true;
+      const curMM = canvas2DToMM(px, py, 1);
+      let nx = curMM.x;
+      let nz = curMM.z;
+
+      if (state.snapToGrid) {
+        nx = Math.round(nx / 50) * 50;
+        nz = Math.round(nz / 50) * 50;
+      }
+
+      // Ortho guide check with connected walls
+      state.orthoGuideLine = null;
+      for (const c of state.draggingVertex.connections) {
+        const otherX = c.endpoint === 'start' ? c.wall.x2 : c.wall.x1;
+        const otherZ = c.endpoint === 'start' ? c.wall.z2 : c.wall.z1;
+        if (Math.abs(nx - otherX) <= 35) {
+          nx = otherX;
+          state.orthoGuideLine = { type: 'vertical', x: otherX };
+          break;
+        }
+        if (Math.abs(nz - otherZ) <= 35) {
+          nz = otherZ;
+          state.orthoGuideLine = { type: 'horizontal', z: otherZ };
+          break;
+        }
+      }
+
+      // Update all connected endpoints
+      state.draggingVertex.connections.forEach((c) => {
+        if (c.endpoint === 'start') {
+          c.wall.x1 = nx;
+          c.wall.z1 = nz;
+        } else {
+          c.wall.x2 = nx;
+          c.wall.z2 = nz;
+        }
+      });
+
+      updateInspectorUI();
+      draw2DFloorplan();
+      return;
+    }
+
+    if (state.drag2DMode === 'wall' && state.draggingWall) {
+      state.hasDragged2D = true;
+      const curMM = canvas2DToMM(px, py, 1);
+      let dx = curMM.x - state.draggingWall.startMouseMM.x;
+      let dz = curMM.z - state.draggingWall.startMouseMM.z;
+
+      if (state.snapToGrid) {
+        dx = Math.round(dx / 50) * 50;
+        dz = Math.round(dz / 50) * 50;
+      }
+
+      const wall = state.draggingWall.wall;
+      wall.x1 = state.draggingWall.origStart.x + dx;
+      wall.z1 = state.draggingWall.origStart.z + dz;
+      wall.x2 = state.draggingWall.origEnd.x + dx;
+      wall.z2 = state.draggingWall.origEnd.z + dz;
+
+      // Connected vertex update
+      state.draggingWall.startConns.forEach((c) => {
+        if (c.endpoint === 'start') {
+          c.wall.x1 = c.origX + dx;
+          c.wall.z1 = c.origZ + dz;
+        } else {
+          c.wall.x2 = c.origX + dx;
+          c.wall.z2 = c.origZ + dz;
+        }
+      });
+
+      state.draggingWall.endConns.forEach((c) => {
+        if (c.endpoint === 'start') {
+          c.wall.x1 = c.origX + dx;
+          c.wall.z1 = c.origZ + dz;
+        } else {
+          c.wall.x2 = c.origX + dx;
+          c.wall.z2 = c.origZ + dz;
+        }
+      });
+
+      updateInspectorUI();
+      draw2DFloorplan();
+      return;
+    }
+
+    if (state.drag2DMode === 'furniture' && state.dragging2DFurnitureId) {
+      state.hasDragged2D = true;
       const mm = canvas2DToMM(px, py, 1);
       const item = state.furnitureList.find((f) => f.id === state.dragging2DFurnitureId);
       if (item) {
@@ -1854,10 +3348,55 @@
         evaluateAllCollisions();
         draw2DFloorplan();
       }
+      return;
+    }
+
+    // Hover state updates when in select tool
+    if (state.drawTool === 'select') {
+      const hitVert = findVertexNearCanvasPoint(px, py, 14);
+      const prevVert = state.hoveredVertex;
+      const prevWall = state.hoveredWallId;
+
+      if (hitVert) {
+        state.hoveredVertex = hitVert;
+        state.hoveredWallId = null;
+        canvas2D.className = 'cursor-crosshair';
+      } else {
+        state.hoveredVertex = null;
+        const curMM = canvas2DToMM(px, py, 1);
+        const hitFurn = findFurnitureAt2DPoint(curMM.x, curMM.z);
+        if (hitFurn) {
+          state.hoveredWallId = null;
+          canvas2D.className = 'cursor-grab';
+        } else {
+          const hitW = findWallNearPoint(curMM, 220);
+          if (hitW) {
+            state.hoveredWallId = hitW.id;
+            canvas2D.className = 'cursor-move';
+          } else {
+            state.hoveredWallId = null;
+            canvas2D.className = 'cursor-default';
+          }
+        }
+      }
+
+      if (state.hoveredVertex !== prevVert || state.hoveredWallId !== prevWall) {
+        draw2DFloorplan();
+      }
     }
   }
 
-  function on2DPointerUp() {
+  function on2DPointerUp(e) {
+    activePointers2D.delete(e.pointerId);
+    if (activePointers2D.size < 2) {
+      isPinching2D = false;
+    }
+
+    if (state.isPanning2D) {
+      state.isPanning2D = false;
+      return;
+    }
+
     if (state.isDrawingWall && state.drawStartPt && state.drawCurrentPt) {
       const len = Math.hypot(
         state.drawCurrentPt.x - state.drawStartPt.x,
@@ -1876,23 +3415,49 @@
         });
         rebuild3DRoomGeometry();
         evaluateAllCollisions();
+        HistoryManager.pushState();
         showToast(`새 벽체 (${Math.round(len)}mm)가 추가되었습니다.`);
       }
     }
     state.isDrawingWall = false;
     state.drawStartPt = null;
     state.drawCurrentPt = null;
-    state.dragging2DFurnitureId = null;
+
+    if (state.drag2DMode === 'vertex') {
+      if (state.hasDragged2D) {
+        rebuild3DRoomGeometry();
+        evaluateAllCollisions();
+        HistoryManager.pushState();
+      }
+      state.draggingVertex = null;
+      state.orthoGuideLine = null;
+    } else if (state.drag2DMode === 'wall') {
+      if (state.hasDragged2D) {
+        rebuild3DRoomGeometry();
+        evaluateAllCollisions();
+        HistoryManager.pushState();
+      }
+      state.draggingWall = null;
+    } else if (state.drag2DMode === 'furniture') {
+      if (state.hasDragged2D) {
+        HistoryManager.pushState();
+      }
+      state.dragging2DFurnitureId = null;
+    }
+
+    state.drag2DMode = null;
+    state.hasDragged2D = false;
     draw2DFloorplan();
   }
 
   function on2DWheel(e) {
     e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.1 : 0.9;
-    state.zoom2D = Math.min(0.28, Math.max(0.04, state.zoom2D * factor));
+    const factor = e.deltaY < 0 ? 1.12 : 0.89;
+    state.zoom2D = Math.min(0.35, Math.max(0.035, state.zoom2D * factor));
     draw2DFloorplan();
   }
 
+  // FIX 8: Safe margin check for door/window placement
   function placeOpeningOnClosestWall(ptMM, type) {
     let bestWall = null;
     let bestT = 0.5;
@@ -1901,10 +3466,17 @@
     state.walls.forEach((w) => {
       const dx = w.x2 - w.x1;
       const dz = w.z2 - w.z1;
+      const lenMM = Math.hypot(dx, dz);
+      if (lenMM < 300) return;
+
       const lenSq = dx * dx + dz * dz;
-      if (lenSq < 1) return;
       let t = ((ptMM.x - w.x1) * dx + (ptMM.z - w.z1) * dz) / lenSq;
-      t = Math.max(0.18, Math.min(0.82, t));
+
+      // Safe margin from wall endpoints
+      const halfW = (type === 'door' ? 450 : 700) + 40;
+      const marginT = Math.min(0.4, halfW / lenMM);
+      t = Math.max(marginT, Math.min(1 - marginT, t));
+
       const projX = w.x1 + t * dx;
       const projZ = w.z1 + t * dz;
       const d = Math.hypot(ptMM.x - projX, ptMM.z - projZ);
@@ -1916,6 +3488,13 @@
     });
 
     if (bestWall && bestDist < 450) {
+      const wallLen = Math.hypot(bestWall.x2 - bestWall.x1, bestWall.z2 - bestWall.z1);
+      const requiredW = type === 'door' ? 900 : 1200;
+      if (wallLen < requiredW + 80) {
+        showToast(`벽 길이(${Math.round(wallLen)}mm)가 요소 폭(${requiredW}mm)보다 짧아 배치할 수 없습니다.`);
+        return;
+      }
+
       state.openings.push({
         id: 'open_' + Date.now(),
         wallId: bestWall.id,
@@ -1929,14 +3508,16 @@
       rebuild3DRoomGeometry();
       evaluateAllCollisions();
       draw2DFloorplan();
-      showToast(type === 'door' ? '방문(개폐 반경 900mm)이 벽에 배치되었습니다.' : '창문이 벽에 배치되었습니다.');
+      HistoryManager.pushState();
+      showToast(type === 'door' ? '방문(개폐 반경 900mm)이 배치되었습니다.' : '창문이 배치되었습니다.');
     } else {
       showToast('문/창문을 배치하려면 기존 벽 선분 위를 클릭하세요.');
     }
   }
 
+  // FIX 2: Accurate point-to-segment distance for erasing walls anywhere along their length
   function erase2DElementNear(ptMM) {
-    // First check openings
+    // 1. Check openings first
     for (let i = state.openings.length - 1; i >= 0; i--) {
       const op = state.openings[i];
       const w = state.walls.find((wall) => wall.id === op.wallId);
@@ -1948,27 +3529,30 @@
         rebuild3DRoomGeometry();
         evaluateAllCollisions();
         draw2DFloorplan();
+        HistoryManager.pushState();
         showToast('문/창문 요소가 삭제되었습니다.');
         return;
       }
     }
 
-    // Check walls
+    // 2. Check all walls using point-to-segment distance
     for (let i = state.walls.length - 1; i >= 0; i--) {
       const w = state.walls[i];
-      const mx = (w.x1 + w.x2) / 2;
-      const mz = (w.z1 + w.z2) / 2;
-      if (Math.hypot(ptMM.x - mx, ptMM.z - mz) < 450) {
+      const dist = distToSegment(ptMM.x, ptMM.z, w.x1, w.z1, w.x2, w.z2);
+      if (dist < 280) {
         const wid = w.id;
         state.walls.splice(i, 1);
         state.openings = state.openings.filter((o) => o.wallId !== wid);
         rebuild3DRoomGeometry();
         evaluateAllCollisions();
         draw2DFloorplan();
+        HistoryManager.pushState();
         showToast('벽체가 삭제되었습니다.');
         return;
       }
     }
+
+    showToast('삭제할 벽 또는 문/창문 위를 클릭하세요.');
   }
 
   function findFurnitureAt2DPoint(xMM, zMM) {
@@ -1981,125 +3565,6 @@
       }
     }
     return null;
-  }
-
-  // ==================== [기능 3] AI 기반 미제공 가구 3D 모델 자동 생성기 ====================
-  function handleAIImageUpload(file) {
-    if (!file || !file.type.startsWith('image/')) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const dataUrl = ev.target.result;
-      const img = new Image();
-      img.onload = () => {
-        // Extract Dominant Color + create normalized texture via HTML5 Canvas
-        const sampleCanvas = document.createElement('canvas');
-        sampleCanvas.width = 128;
-        sampleCanvas.height = 128;
-        const sCtx = sampleCanvas.getContext('2d');
-        sCtx.drawImage(img, 0, 0, 128, 128);
-
-        const imgData = sCtx.getImageData(16, 16, 96, 96).data;
-        let rSum = 0, gSum = 0, bSum = 0, count = 0;
-        for (let i = 0; i < imgData.length; i += 4) {
-          const a = imgData[i + 3];
-          if (a < 128) continue;
-          rSum += imgData[i];
-          gSum += imgData[i + 1];
-          bSum += imgData[i + 2];
-          count++;
-        }
-        if (count > 0) {
-          const r = Math.round(rSum / count);
-          const g = Math.round(gSum / count);
-          const b = Math.round(bSum / count);
-          const hex = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
-          state.aiExtractedHex = hex;
-          document.getElementById('ai-fallback-color').value = hex;
-          document.getElementById('ai-fallback-color-label').textContent = hex;
-          document.getElementById('ai-extracted-swatch').style.background = hex;
-          document.getElementById('ai-extracted-hex').textContent = `추출 색상: ${hex}`;
-        }
-
-        state.aiUploadedImageDataUrl = sampleCanvas.toDataURL('image/jpeg', 0.85);
-        const previewImg = document.getElementById('ai-preview-img');
-        previewImg.src = dataUrl;
-        document.getElementById('ai-dropzone-prompt').classList.add('hidden');
-        document.getElementById('ai-preview-wrap').classList.remove('hidden');
-      };
-      img.src = dataUrl;
-    };
-    reader.readAsDataURL(file);
-  }
-
-  function triggerAIFurnitureGeneration() {
-    const name = document.getElementById('ai-furn-name').value.trim() || 'AI 커스텀 가구';
-    const category = document.getElementById('ai-furn-category').value;
-    const shape = document.getElementById('ai-furn-shape').value;
-    const w = Math.max(200, Number(document.getElementById('ai-dim-w').value) || 1200);
-    const d = Math.max(200, Number(document.getElementById('ai-dim-d').value) || 700);
-    const h = Math.max(200, Number(document.getElementById('ai-dim-h').value) || 750);
-    const color = document.getElementById('ai-fallback-color').value || state.aiExtractedHex;
-
-    const loadingBox = document.getElementById('ai-loading-box');
-    const progressBar = document.getElementById('ai-progress-bar');
-    const stepText = document.getElementById('ai-loading-step');
-    const genBtn = document.getElementById('btn-generate-ai-furniture');
-
-    loadingBox.classList.remove('hidden');
-    genBtn.disabled = true;
-    progressBar.style.width = '0%';
-
-    const startTime = performance.now();
-    const duration = 1500; // 1.5s AI analysis & procedural mesh synthesis simulation
-
-    function stepAnim(now) {
-      const elapsed = now - startTime;
-      const pct = Math.min(100, Math.round((elapsed / duration) * 100));
-      progressBar.style.width = pct + '%';
-
-      if (pct < 35) {
-        stepText.textContent = '1/3 HTML5 Canvas 픽셀 샘플링 및 주요 색상(Dominant Color) 추출 중...';
-      } else if (pct < 75) {
-        stepText.textContent = `2/3 [${category.toUpperCase()} + ${shape}] 절차적 3D 지오메트리 합성 중...`;
-      } else {
-        stepText.textContent = '3/3 THREE.CanvasTexture UV 매핑 및 충돌 경계 상자(Box3) 생성 중...';
-      }
-
-      if (elapsed < duration) {
-        requestAnimationFrame(stepAnim);
-      } else {
-        loadingBox.classList.add('hidden');
-        genBtn.disabled = false;
-
-        const aiTemplate = {
-          catalogId: 'ai_custom_' + Date.now(),
-          name,
-          category,
-          shape,
-          w,
-          d,
-          h,
-          color,
-          textureDataUrl: state.aiUploadedImageDataUrl,
-          tag: 'AI 생성',
-          isAI: true,
-          ergoClearance: { front: 600, side: 200 }
-        };
-
-        // Save to '내 AI 가구 보관함'
-        state.aiVault.unshift(aiTemplate);
-        renderAIVaultUI();
-
-        // Switch to 3D mode if currently in 2D and place in room center
-        if (state.mode !== '3d') {
-          switchViewportMode('3d');
-        }
-        addFurnitureFromTemplate(aiTemplate, { x: 0, z: 0, rotY: 0 });
-        showToast(`AI 커스텀 가구 '${name}' 생성 완료 및 공간 중앙 배치!`);
-      }
-    }
-
-    requestAnimationFrame(stepAnim);
   }
 
   // ==================== UI RENDERING & BINDINGS ====================
@@ -2138,79 +3603,127 @@
     state.aiVault.forEach((item) => {
       const card = document.createElement('div');
       card.className = 'catalog-card';
-      const thumbStyle = item.textureDataUrl
-        ? `background-image:url('${item.textureDataUrl}'); background-size:cover;`
-        : `background:${item.color};`;
       card.innerHTML = `
         <div class="catalog-card-top">
-          <span class="catalog-swatch" style="${thumbStyle}"></span>
-          <span class="catalog-tag" style="color:#A5B4FC;">AI Custom</span>
+          <span class="catalog-swatch" style="background:${item.color || '#4F46E5'};"></span>
+          <span class="catalog-tag" style="color:#A5B4FC;">${item.tag || 'AI Custom'}</span>
         </div>
         <div class="catalog-name">${item.name}</div>
         <div class="catalog-dim">${item.w} × ${item.d} × ${item.h} mm</div>
       `;
       card.addEventListener('click', () => {
         addFurnitureFromTemplate(item, { x: 0, z: 0, rotY: 0 });
-        showToast(`AI 보관함에서 '${item.name}' 가구를 배치했습니다.`);
+        showToast(`보관함에서 '${item.name}' 가구를 배치했습니다.`);
       });
       vaultEl.appendChild(card);
     });
   }
 
+  // FIX 7: Render Placed Furniture list in both empty and selected states for seamless switching
   function renderPlacedFurnitureListUI() {
-    const countEl = document.getElementById('placed-count');
-    const listEl = document.getElementById('placed-furniture-list');
-    countEl.textContent = state.furnitureList.length;
-    listEl.innerHTML = '';
+    const countEls = document.querySelectorAll('#placed-count, .placed-count-alt');
+    countEls.forEach((el) => {
+      if (el) el.textContent = state.furnitureList.length;
+    });
 
-    state.furnitureList.forEach((item) => {
-      const row = document.createElement('div');
-      row.className = 'placed-item-row' + (item.isColliding ? ' colliding' : '');
-      row.innerHTML = `
-        <span>${item.name}</span>
-        <span class="mono-val">${item.isColliding ? '충돌 경고' : `${item.w}×${item.d}`}</span>
-      `;
-      row.addEventListener('click', () => selectFurniture(item.id));
-      listEl.appendChild(row);
+    const listContainers = document.querySelectorAll('.placed-list');
+    listContainers.forEach((listEl) => {
+      listEl.innerHTML = '';
+      if (state.furnitureList.length === 0) {
+        listEl.innerHTML = '<div style="color:var(--text-secondary); font-size:11px; padding:6px 0;">배치된 가구가 없습니다.</div>';
+        return;
+      }
+      state.furnitureList.forEach((item) => {
+        const row = document.createElement('div');
+        const isSelected = item.id === state.selectedFurnitureId;
+        row.className = 'placed-item-row' + (item.isColliding ? ' colliding' : '') + (isSelected ? ' selected' : '');
+        row.innerHTML = `
+          <span>${item.name}</span>
+          <span class="mono-val">${item.isColliding ? '충돌 경고' : `${item.w}×${item.d}`}</span>
+        `;
+        row.addEventListener('click', () => selectFurniture(item.id));
+        listEl.appendChild(row);
+      });
     });
   }
 
   function updateInspectorUI() {
     const emptyState = document.getElementById('inspector-empty-state');
     const furnState = document.getElementById('inspector-furniture-state');
+    const wallState = document.getElementById('inspector-wall-state');
     const badge = document.getElementById('inspector-target-badge');
 
-    const item = state.furnitureList.find((f) => f.id === state.selectedFurnitureId);
-    if (!item) {
-      emptyState.classList.remove('hidden');
-      furnState.classList.add('hidden');
-      badge.textContent = '공간 설정';
-      renderPlacedFurnitureListUI();
-      return;
+    // Case 1: Furniture Selected
+    if (state.selectedFurnitureId) {
+      const item = state.furnitureList.find((f) => f.id === state.selectedFurnitureId);
+      if (item) {
+        if (emptyState) emptyState.classList.add('hidden');
+        if (wallState) wallState.classList.add('hidden');
+        if (furnState) furnState.classList.remove('hidden');
+        if (badge) badge.textContent = item.isGLB ? 'GLB 3D 가구' : (item.isAI ? 'AI 커스텀 가구' : '선택된 가구');
+
+        document.getElementById('prop-item-category').textContent = `${(item.category || 'decor').toUpperCase()} · ${item.shape || 'CUSTOM'}`;
+        document.getElementById('prop-item-name').textContent = item.name;
+
+        syncInspectorPositionFields(item);
+
+        const rotDeg = ((Math.round(item.rotY) % 360) + 360) % 360;
+        document.getElementById('prop-rot-slider').value = rotDeg;
+        document.getElementById('prop-rot-value').textContent = `${rotDeg}°`;
+
+        document.getElementById('prop-dim-w').value = item.w;
+        document.getElementById('prop-dim-d').value = item.d;
+        document.getElementById('prop-dim-h').value = item.h;
+
+        document.getElementById('prop-color-picker').value = item.color || '#6B7280';
+        document.getElementById('prop-color-hex').textContent = (item.color || '#6B7280').toUpperCase();
+        document.getElementById('prop-ergo-toggle').checked = item.ergoVisible !== false;
+
+        updateSelectedCollisionUI();
+        renderPlacedFurnitureListUI();
+        return;
+      }
     }
 
-    emptyState.classList.add('hidden');
-    furnState.classList.remove('hidden');
-    badge.textContent = item.isAI ? 'AI 커스텀 가구' : '선택된 가구';
+    // Case 2: Wall Selected
+    if (state.selectedWallId) {
+      const wall = state.walls.find((w) => w.id === state.selectedWallId);
+      if (wall) {
+        if (emptyState) emptyState.classList.add('hidden');
+        if (furnState) furnState.classList.add('hidden');
+        if (wallState) wallState.classList.remove('hidden');
+        if (badge) badge.textContent = '선택된 벽체';
 
-    document.getElementById('prop-item-category').textContent = `${item.category.toUpperCase()} · ${item.shape}`;
-    document.getElementById('prop-item-name').textContent = item.name;
+        const lenMM = Math.round(Math.hypot(wall.x2 - wall.x1, wall.z2 - wall.z1));
+        const titleEl = document.getElementById('prop-wall-title');
+        if (titleEl) titleEl.textContent = `벽체 (ID: ${wall.id})`;
 
-    syncInspectorPositionFields(item);
+        const lenInput = document.getElementById('prop-wall-length');
+        if (lenInput) lenInput.value = lenMM;
 
-    const rotDeg = ((Math.round(item.rotY) % 360) + 360) % 360;
-    document.getElementById('prop-rot-slider').value = rotDeg;
-    document.getElementById('prop-rot-value').textContent = `${rotDeg}°`;
+        const thickInput = document.getElementById('prop-wall-thickness');
+        if (thickInput) thickInput.value = wall.thickness || state.wallThickness;
 
-    document.getElementById('prop-dim-w').value = item.w;
-    document.getElementById('prop-dim-d').value = item.d;
-    document.getElementById('prop-dim-h').value = item.h;
+        const heightInput = document.getElementById('prop-wall-height');
+        if (heightInput) heightInput.value = wall.height || state.ceilingHeight;
 
-    document.getElementById('prop-color-picker').value = item.color || '#6B7280';
-    document.getElementById('prop-color-hex').textContent = (item.color || '#6B7280').toUpperCase();
-    document.getElementById('prop-ergo-toggle').checked = item.ergoVisible !== false;
+        const wallOpenings = state.openings.filter((o) => o.wallId === wall.id);
+        const doorsCount = wallOpenings.filter((o) => o.type === 'door').length;
+        const winsCount = wallOpenings.filter((o) => o.type === 'window').length;
+        const infoEl = document.getElementById('prop-wall-openings-info');
+        if (infoEl) infoEl.textContent = `방문 ${doorsCount}개, 창문 ${winsCount}개 부착됨`;
 
-    updateSelectedCollisionUI();
+        renderPlacedFurnitureListUI();
+        return;
+      }
+    }
+
+    // Case 3: Nothing Selected (Room Setting)
+    if (emptyState) emptyState.classList.remove('hidden');
+    if (furnState) furnState.classList.add('hidden');
+    if (wallState) wallState.classList.add('hidden');
+    if (badge) badge.textContent = '공간 설정';
+    renderPlacedFurnitureListUI();
   }
 
   function syncInspectorPositionFields(item) {
@@ -2260,6 +3773,11 @@
     document.getElementById('viewport-2d').classList.toggle('active', mode === '2d');
     document.getElementById('viewport-3d').classList.toggle('active', mode === '3d');
 
+    const mbLabel = document.getElementById('mb-mode-label');
+    if (mbLabel) {
+      mbLabel.textContent = mode === '2d' ? '3D 보기' : '2D 도면';
+    }
+
     if (mode === '3d') {
       rebuild3DRoomGeometry();
       evaluateAllCollisions();
@@ -2269,6 +3787,18 @@
     }
   }
 
+  // 2D Draw Tools (Top-Level Scope)
+  function setDrawTool(tool) {
+    state.drawTool = tool;
+    document.querySelectorAll('.draw-tool-btn, .hud-tool-chip').forEach((b) => {
+      b.classList.toggle('active', b.dataset.tool === tool);
+    });
+    if (canvas2D) {
+      canvas2D.className = 'cursor-' + tool;
+    }
+    if (state.mode !== '2d') switchViewportMode('2d');
+  }
+
   function updatePresetCardUI() {
     document.querySelectorAll('.preset-card').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.preset === state.activePreset);
@@ -2276,16 +3806,99 @@
   }
 
   function bindUIEvents() {
-    // Mode Switch Buttons
+    // Device Mode Toggle (PC vs Mobile)
+    const btnDeviceMode = document.getElementById('btn-toggle-device-mode');
+    if (btnDeviceMode) {
+      btnDeviceMode.addEventListener('click', () => {
+        const nextMode = state.deviceMode === 'mobile' ? 'pc' : 'mobile';
+        setDeviceMode(nextMode, true);
+        showToast(nextMode === 'mobile' ? '📱 모바일/태블릿 최적화 모드로 전환되었습니다.' : '💻 PC 프로페셔널 CAD 모드로 전환되었습니다.');
+      });
+    }
+
+    // Mobile Hamburger Menu Button
+    const btnMobileMenu = document.getElementById('btn-mobile-menu');
+    if (btnMobileMenu) {
+      btnMobileMenu.addEventListener('click', () => {
+        const leftSidebar = document.getElementById('left-sidebar');
+        if (leftSidebar && leftSidebar.classList.contains('mobile-open')) {
+          closeMobileDrawers();
+        } else {
+          openMobileDrawer('left');
+        }
+      });
+    }
+
+    // Drawer Close Buttons & Backdrop
+    const btnCloseLeft = document.getElementById('btn-close-left-sidebar');
+    if (btnCloseLeft) btnCloseLeft.addEventListener('click', closeMobileDrawers);
+
+    const btnCloseInsp = document.getElementById('btn-close-inspector');
+    if (btnCloseInsp) btnCloseInsp.addEventListener('click', closeMobileDrawers);
+
+    const backdrop = document.getElementById('mobile-drawer-backdrop');
+    if (backdrop) backdrop.addEventListener('click', closeMobileDrawers);
+
+    // Mobile Bottom Nav Bar Buttons
+    const mbCatalog = document.getElementById('mb-btn-catalog');
+    if (mbCatalog) {
+      mbCatalog.addEventListener('click', () => {
+        const leftSidebar = document.getElementById('left-sidebar');
+        if (leftSidebar && leftSidebar.classList.contains('mobile-open')) {
+          closeMobileDrawers();
+        } else {
+          openMobileDrawer('left');
+        }
+      });
+    }
+
+    const mbModeToggle = document.getElementById('mb-btn-mode-toggle');
+    if (mbModeToggle) {
+      mbModeToggle.addEventListener('click', () => {
+        switchViewportMode(state.mode === '2d' ? '3d' : '2d');
+      });
+    }
+
+    const mbTools = document.getElementById('mb-btn-tools');
+    if (mbTools) {
+      mbTools.addEventListener('click', () => {
+        if (state.mode !== '2d') switchViewportMode('2d');
+        const tab1 = document.querySelector('.sidebar-tab[data-tab="tab-floorplan"]');
+        if (tab1) tab1.click();
+        openMobileDrawer('left');
+      });
+    }
+
+    const mbInspector = document.getElementById('mb-btn-inspector');
+    if (mbInspector) {
+      mbInspector.addEventListener('click', () => {
+        const rightSidebar = document.getElementById('right-sidebar');
+        if (rightSidebar && rightSidebar.classList.contains('mobile-open')) {
+          closeMobileDrawers();
+        } else {
+          openMobileDrawer('right');
+        }
+      });
+    }
+
+    const mbUndo = document.getElementById('mb-btn-undo');
+    if (mbUndo) {
+      mbUndo.addEventListener('click', () => {
+        HistoryManager.undo();
+      });
+    }
+
+
+    // Mode Switch
     document.getElementById('btn-mode-2d').addEventListener('click', () => switchViewportMode('2d'));
     document.getElementById('btn-mode-3d').addEventListener('click', () => switchViewportMode('3d'));
     document.getElementById('btn-open-2d-editor').addEventListener('click', () => switchViewportMode('2d'));
     document.getElementById('btn-2d-to-3d-extrude').addEventListener('click', () => {
       switchViewportMode('3d');
-      showToast('2D 단면도를 3D 벽체 및 공간 메쉬로 입체 변환(Extrusion)했습니다.');
+      showToast('2D 단면도를 3D 벽체 및 공간 메쉬로 입체 변환(Extrude)했습니다.');
     });
 
-    // Left Sidebar Tabs
+    // Left Sidebar Main Tabs
     document.querySelectorAll('.sidebar-tab').forEach((tabBtn) => {
       tabBtn.addEventListener('click', () => {
         document.querySelectorAll('.sidebar-tab').forEach((b) => b.classList.remove('active'));
@@ -2295,15 +3908,26 @@
       });
     });
 
+    // Sub-tab switch (AI Blueprint vs GLB Upload)
+    document.querySelectorAll('.subtab-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.subtab-btn').forEach((b) => b.classList.remove('active'));
+        document.querySelectorAll('.ai-subpanel').forEach((p) => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById(btn.dataset.subtab).classList.add('active');
+      });
+    });
+
     // Preset Cards
     document.querySelectorAll('.preset-card').forEach((card) => {
       card.addEventListener('click', () => {
         loadFloorplanPreset(card.dataset.preset, false);
+        HistoryManager.pushState();
         showToast(`'${state.roomName}' 프리셋 구조가 적용되었습니다.`);
       });
     });
 
-    // Custom Room Dimensions Apply
+    // Custom Room Dim Apply
     document.getElementById('btn-apply-room-dim').addEventListener('click', () => {
       const W = Math.max(1500, Number(document.getElementById('room-width-input').value) || 3500);
       const D = Math.max(1500, Number(document.getElementById('room-depth-input').value) || 4500);
@@ -2325,30 +3949,85 @@
       rebuild3DRoomGeometry();
       evaluateAllCollisions();
       draw2DFloorplan();
+      HistoryManager.pushState();
       showToast(`방 치수(${W}×${D}×${H}mm)가 2D/3D 공간에 반영되었습니다.`);
     });
 
-    // 2D Drawing Tool Selection (Left Sidebar & 2D Floating Toolbar synced)
-    function setDrawTool(tool) {
-      state.drawTool = tool;
-      document.querySelectorAll('.draw-tool-btn, .hud-tool-chip').forEach((b) => {
-        b.classList.toggle('active', b.dataset.tool === tool);
-      });
-      if (state.mode !== '2d') {
-        switchViewportMode('2d');
-      }
-    }
-
+    // 2D Draw Tools Button Bindings
     document.querySelectorAll('.draw-tool-btn, .hud-tool-chip').forEach((btn) => {
       btn.addEventListener('click', () => setDrawTool(btn.dataset.tool));
     });
 
+    // Undo / Redo Header Buttons
+    const btnUndo = document.getElementById('btn-undo');
+    if (btnUndo) btnUndo.addEventListener('click', () => HistoryManager.undo());
+
+    const btnRedo = document.getElementById('btn-redo');
+    if (btnRedo) btnRedo.addEventListener('click', () => HistoryManager.redo());
+
+    // Wall Inspector Controls
+    const btnDeselectWall = document.getElementById('btn-deselect-wall');
+    if (btnDeselectWall) btnDeselectWall.addEventListener('click', () => selectWall(null));
+
+    const btnDeleteWall = document.getElementById('btn-delete-wall');
+    if (btnDeleteWall) btnDeleteWall.addEventListener('click', deleteSelectedWall);
+
+    const btnApplyWallLen = document.getElementById('btn-apply-wall-length');
+    if (btnApplyWallLen) {
+      btnApplyWallLen.addEventListener('click', () => {
+        const val = Number(document.getElementById('prop-wall-length').value);
+        applySelectedWallLength(val);
+      });
+    }
+
+    const wallLenInput = document.getElementById('prop-wall-length');
+    if (wallLenInput) {
+      wallLenInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          applySelectedWallLength(Number(wallLenInput.value));
+        }
+      });
+    }
+
+    const wallThickInput = document.getElementById('prop-wall-thickness');
+    if (wallThickInput) {
+      wallThickInput.addEventListener('change', (e) => {
+        if (!state.selectedWallId) return;
+        const wall = state.walls.find((w) => w.id === state.selectedWallId);
+        if (wall) {
+          wall.thickness = Math.max(80, Math.min(500, Number(e.target.value) || 160));
+          rebuild3DRoomGeometry();
+          evaluateAllCollisions();
+          draw2DFloorplan();
+          HistoryManager.pushState();
+        }
+      });
+    }
+
+    const wallHeightInput = document.getElementById('prop-wall-height');
+    if (wallHeightInput) {
+      wallHeightInput.addEventListener('change', (e) => {
+        if (!state.selectedWallId) return;
+        const wall = state.walls.find((w) => w.id === state.selectedWallId);
+        if (wall) {
+          wall.height = Math.max(1500, Math.min(5000, Number(e.target.value) || 2400));
+          rebuild3DRoomGeometry();
+          evaluateAllCollisions();
+          draw2DFloorplan();
+          HistoryManager.pushState();
+        }
+      });
+    }
+
+    // FIX 3: Reset state.floorPolygon as well when clearing 2D walls
     document.getElementById('btn-clear-2d-walls').addEventListener('click', () => {
       state.walls = [];
       state.openings = [];
+      state.floorPolygon = [];
       rebuild3DRoomGeometry();
       draw2DFloorplan();
-      showToast('모든 벽체와 문/창문이 초기화되었습니다. 2D 캔버스에서 새로 그려보세요.');
+      HistoryManager.pushState();
+      showToast('모든 벽체와 문/창문, 바닥 경계가 초기화되었습니다. 2D 캔버스에서 새로 그려보세요.');
     });
 
     // Header Utilities
@@ -2361,7 +4040,7 @@
       showToast('카메라 시점이 초기화되었습니다.');
     });
 
-    // Save & Load State via localStorage
+    // Save & Load State
     document.getElementById('btn-save-state').addEventListener('click', () => {
       const payload = {
         roomName: state.roomName,
@@ -2373,12 +4052,12 @@
         furnitureList: state.furnitureList,
         aiVault: state.aiVault
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-      showToast('현재 인테리어 도면 및 가구 배치가 브라우저(localStorage)에 저장되었습니다.');
+      localStorage.setItem(STORAGE_KEY_STATE, JSON.stringify(payload));
+      showToast('현재 도면 및 가구 배치가 브라우저(localStorage)에 저장되었습니다.');
     });
 
     document.getElementById('btn-load-state').addEventListener('click', () => {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = localStorage.getItem(STORAGE_KEY_STATE);
       if (!raw) {
         showToast('저장된 인테리어 데이터가 없습니다.');
         return;
@@ -2399,7 +4078,21 @@
 
         (data.furnitureList || []).forEach((item) => {
           state.furnitureList.push(item);
-          const meshGroup = createProceduralFurnitureGroup(item);
+          let meshGroup = null;
+
+          if (item.isGLB) {
+            const cachedScene = state.glbModelCache.get(item.catalogId) || state.glbModelCache.get(item.id);
+            if (cachedScene) {
+              meshGroup = buildGLBFurnitureGroup(cachedScene, item);
+            } else {
+              const bp = item.blueprintData || generateSmartBlueprint('modern_rect_desk', item.w, item.d, item.h, item.color, 'wood');
+              meshGroup = buildFurnitureFromAIJson(bp, item);
+            }
+          } else {
+            const bp = item.blueprintData || generateSmartBlueprint(item.shape, item.w, item.d, item.h, item.color, item.materialType);
+            meshGroup = buildFurnitureFromAIJson(bp, item);
+          }
+
           furnitureGroup.add(meshGroup);
           furnitureMeshMap.set(item.id, meshGroup);
         });
@@ -2417,7 +4110,7 @@
       }
     });
 
-    // Global Ergo & Snap Checkboxes
+    // Global Ergo & Snap
     document.getElementById('chk-global-ergo').addEventListener('change', (e) => {
       state.globalErgoVisible = e.target.checked;
       roomGroup.traverse((obj) => {
@@ -2430,6 +4123,104 @@
     document.getElementById('chk-snap-grid').addEventListener('change', (e) => {
       state.snapToGrid = e.target.checked;
     });
+
+    // AI Provider Select & Key Persistence
+    document.getElementById('ai-provider-select').addEventListener('change', (e) => {
+      state.aiConfig.provider = e.target.value;
+      saveAIConfig();
+      syncAIConfigUI();
+    });
+
+    document.getElementById('btn-save-api-key').addEventListener('click', () => {
+      const key = document.getElementById('ai-api-key-input').value.trim();
+      if (state.aiConfig.provider === 'gemini') {
+        state.aiConfig.geminiApiKey = key;
+      } else if (state.aiConfig.provider === 'openai') {
+        state.aiConfig.openaiApiKey = key;
+      }
+      saveAIConfig();
+      showToast(`${state.aiConfig.provider.toUpperCase()} API 키가 저장되었습니다.`);
+    });
+
+    document.getElementById('btn-save-ollama-cfg').addEventListener('click', () => {
+      state.aiConfig.ollamaUrl = document.getElementById('ai-ollama-url').value.trim();
+      state.aiConfig.ollamaModel = document.getElementById('ai-ollama-model').value.trim();
+      saveAIConfig();
+      syncAIConfigUI();
+      showToast('Ollama 로컬 서버 설정이 저장되었습니다.');
+    });
+
+    // AI Studio Image Dropzone
+    const dropzone = document.getElementById('ai-dropzone');
+    const fileInput = document.getElementById('ai-image-input');
+
+    dropzone.addEventListener('click', (e) => {
+      if (e.target.id === 'btn-remove-ai-img') return;
+      fileInput.click();
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files[0]) handleAIImageUpload(e.target.files[0]);
+    });
+
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropzone.classList.add('dragover');
+    });
+
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) handleAIImageUpload(e.dataTransfer.files[0]);
+    });
+
+    document.getElementById('btn-remove-ai-img').addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.aiUploadedBase64 = null;
+      fileInput.value = '';
+      document.getElementById('ai-dropzone-prompt').classList.remove('hidden');
+      document.getElementById('ai-preview-wrap').classList.add('hidden');
+    });
+
+    document.getElementById('ai-fallback-color').addEventListener('input', (e) => {
+      document.getElementById('ai-fallback-color-label').textContent = e.target.value.toUpperCase();
+    });
+
+    document.getElementById('btn-generate-ai-furniture').addEventListener('click', triggerAIFurnitureGeneration);
+
+    // GLB / GLTF Upload Handlers
+    const glbDropzone = document.getElementById('glb-dropzone');
+    const glbFileInput = document.getElementById('glb-file-input');
+
+    glbDropzone.addEventListener('click', () => glbFileInput.click());
+    document.getElementById('btn-trigger-glb-select').addEventListener('click', () => glbFileInput.click());
+
+    glbDropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      glbDropzone.classList.add('dragover');
+    });
+    glbDropzone.addEventListener('dragleave', () => glbDropzone.classList.remove('dragover'));
+    glbDropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      glbDropzone.classList.remove('dragover');
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+        processGLBFile(e.dataTransfer.files[0]);
+      }
+    });
+
+    glbFileInput.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files[0]) processGLBFile(e.target.files[0]);
+    });
+
+    function processGLBFile(file) {
+      const name = document.getElementById('glb-furn-name').value.trim() || file.name;
+      const w = Number(document.getElementById('glb-dim-w').value) || 800;
+      const d = Number(document.getElementById('glb-dim-d').value) || 800;
+      const h = Number(document.getElementById('glb-dim-h').value) || 750;
+      handleGLBUpload(file, w, d, h, name);
+    }
 
     // Right Inspector Controls
     ['prop-pos-x', 'prop-pos-y', 'prop-pos-z'].forEach((inputId) => {
@@ -2455,17 +4246,13 @@
       item.rotY = Number(e.target.value);
       document.getElementById('prop-rot-value').textContent = `${item.rotY}°`;
       const mesh = furnitureMeshMap.get(item.id);
-      if (mesh) {
-        mesh.rotation.y = THREE.MathUtils.degToRad(item.rotY);
-      }
+      if (mesh) mesh.rotation.y = THREE.MathUtils.degToRad(item.rotY);
       evaluateAllCollisions();
       draw2DFloorplan();
     });
 
     document.querySelectorAll('.rot-quick-btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        rotateSelectedFurnitureBy(Number(btn.dataset.rotDelta));
-      });
+      btn.addEventListener('click', () => rotateSelectedFurnitureBy(Number(btn.dataset.rotDelta)));
     });
 
     document.querySelectorAll('.rot-set-btn').forEach((btn) => {
@@ -2490,21 +4277,32 @@
       rebuildSingleFurnitureMesh(item);
       evaluateAllCollisions();
       draw2DFloorplan();
+      HistoryManager.pushState();
       showToast(`'${item.name}' 치수가 ${item.w}×${item.d}×${item.h}mm로 변경되었습니다.`);
     });
 
+    // FIX 4b: Fast smooth non-destructive color update
     document.getElementById('prop-color-picker').addEventListener('input', (e) => {
       const item = state.furnitureList.find((f) => f.id === state.selectedFurnitureId);
       if (!item) return;
-      item.color = e.target.value;
-      document.getElementById('prop-color-hex').textContent = item.color.toUpperCase();
-      const mesh = furnitureMeshMap.get(item.id);
-      if (mesh && mesh.userData.primaryMaterial) {
-        mesh.userData.primaryMaterial.map = null;
-        mesh.userData.primaryMaterial.color.set(item.color);
-        mesh.userData.primaryMaterial.needsUpdate = true;
-      }
+      const newHex = e.target.value;
+      document.getElementById('prop-color-hex').textContent = newHex.toUpperCase();
+      updateFurnitureMaterialColor(item, newHex);
       draw2DFloorplan();
+    });
+
+    document.getElementById('prop-color-picker').addEventListener('change', () => {
+      HistoryManager.pushState();
+    });
+
+    document.getElementById('prop-rot-slider').addEventListener('change', () => {
+      HistoryManager.pushState();
+    });
+
+    ['prop-pos-x', 'prop-pos-y', 'prop-pos-z'].forEach((id) => {
+      document.getElementById(id)?.addEventListener('change', () => {
+        HistoryManager.pushState();
+      });
     });
 
     document.getElementById('prop-ergo-toggle').addEventListener('change', (e) => {
@@ -2529,52 +4327,6 @@
 
     document.getElementById('btn-deselect-item').addEventListener('click', () => selectFurniture(null));
     document.getElementById('btn-delete-item').addEventListener('click', deleteSelectedFurniture);
-
-    // AI Studio Dropzone & Controls
-    const dropzone = document.getElementById('ai-dropzone');
-    const fileInput = document.getElementById('ai-image-input');
-
-    dropzone.addEventListener('click', (e) => {
-      if (e.target.id === 'btn-remove-ai-img') return;
-      fileInput.click();
-    });
-
-    fileInput.addEventListener('change', (e) => {
-      if (e.target.files && e.target.files[0]) {
-        handleAIImageUpload(e.target.files[0]);
-      }
-    });
-
-    dropzone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      dropzone.classList.add('dragover');
-    });
-
-    dropzone.addEventListener('dragleave', () => {
-      dropzone.classList.remove('dragover');
-    });
-
-    dropzone.addEventListener('drop', (e) => {
-      e.preventDefault();
-      dropzone.classList.remove('dragover');
-      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-        handleAIImageUpload(e.dataTransfer.files[0]);
-      }
-    });
-
-    document.getElementById('btn-remove-ai-img').addEventListener('click', (e) => {
-      e.stopPropagation();
-      state.aiUploadedImageDataUrl = null;
-      fileInput.value = '';
-      document.getElementById('ai-dropzone-prompt').classList.remove('hidden');
-      document.getElementById('ai-preview-wrap').classList.add('hidden');
-    });
-
-    document.getElementById('ai-fallback-color').addEventListener('input', (e) => {
-      document.getElementById('ai-fallback-color-label').textContent = e.target.value.toUpperCase();
-    });
-
-    document.getElementById('btn-generate-ai-furniture').addEventListener('click', triggerAIFurnitureGeneration);
   }
 
   let toastTimer = null;
@@ -2584,10 +4336,31 @@
     el.textContent = msg;
     el.classList.remove('hidden');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => {
-      el.classList.add('hidden');
-    }, 3200);
+    toastTimer = setTimeout(() => el.classList.add('hidden'), 3200);
   }
+
+  // Export for debugging and external tests
+  window.state = state;
+  window.spaceCraftState = state;
+  window.extractJsonFromAiResponse = extractJsonFromAiResponse;
+  window.addFurnitureFromTemplate = addFurnitureFromTemplate;
+  window.evaluateAllCollisions = evaluateAllCollisions;
+  window.furnitureMeshMap = furnitureMeshMap;
+  window.roomGroup = roomGroup;
+  window.scene = scene;
+  window.furnitureGroup = furnitureGroup;
+  window.HistoryManager = HistoryManager;
+  window.setDeviceMode = setDeviceMode;
+  window.openMobileDrawer = openMobileDrawer;
+  window.closeMobileDrawers = closeMobileDrawers;
+  window.selectFurniture = selectFurniture;
+  window.selectWall = selectWall;
+  window.deleteSelectedWall = deleteSelectedWall;
+  window.applySelectedWallLength = applySelectedWallLength;
+  window.rebuild3DRoomGeometry = rebuild3DRoomGeometry;
+  window.loadFloorplanPreset = loadFloorplanPreset;
+  window.setDrawTool = setDrawTool;
+  window.switchViewportMode = switchViewportMode;
 
   // ==================== RENDER LOOP ====================
   function animate() {

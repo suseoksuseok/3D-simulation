@@ -1,0 +1,58 @@
+{
+  "total_tests": 10,
+  "passed": 10,
+  "failed": 0,
+  "results": [
+    {
+      "name": "TEST 1: Initial Page Load & History Buttons",
+      "status": "PASSED",
+      "details": "{'wallsCount': 4, 'furnCount': 4, 'historyLen': 1, 'redoLen': 0, 'undoDisabled': True, 'redoDisabled': True, 'roomName': '① 원룸 오픈형 (3500 × 4500 mm)'}"
+    },
+    {
+      "name": "TEST 2: Furniture Add, Undo, and Redo",
+      "status": "PASSED",
+      "details": "{'initialCount': 4, 'countAfterAdd': 5, 'canUndoAfterAdd': True, 'countAfterUndo': 4, 'canRedoAfterUndo': True, 'countAfterRedo': 5}"
+    },
+    {
+      "name": "TEST 3: Room Preset Change, Undo, and Redo",
+      "status": "PASSED",
+      "details": "{'origRoom': '① 원룸 오픈형 (3500 × 4500 mm)', 'changedRoom': '② 분리형 1.5룸 (5200 × 4200 mm)', 'changedWalls': 5, 'undoneRoom': '① 원룸 오픈형 (3500 × 4500 mm)', 'redoneRoom': '② 분리형 1.5룸 (5200 × 4200 mm)'}"
+    },
+    {
+      "name": "TEST 4: Wall Selection & Inspector Wall State Display",
+      "status": "PASSED",
+      "details": "{'selectedWallId': 'wall_top', 'wallPanelVisible': True, 'furnPanelHidden': True, 'emptyPanelHidden': True, 'inputValue': 5200, 'realWallLen': 5200}"
+    },
+    {
+      "name": "TEST 5: Wall Length Numeric Editing & Undo/Redo",
+      "status": "PASSED",
+      "details": "{'origLen': 5200, 'newLen': 4800, 'undoLen': 5200, 'redoLen': 4800}"
+    },
+    {
+      "name": "TEST 6: Wall Drag Parallel Move & Connected Vertex Update",
+      "status": "PASSED",
+      "details": "{'origTopZ': -2250, 'origLeftZ2': -2250, 'origRightZ1': -2250, 'movedTopZ': -2650, 'movedLeftZ2': -2650, 'movedRightZ1': -2650, 'undoneTopZ': -2250, 'undoneLeftZ2': -2250}"
+    },
+    {
+      "name": "TEST 7: Corner Vertex Dragging & Angle/Length Stretch",
+      "status": "PASSED",
+      "details": "{'origX': -1750, 'origZ': -2250, 'movedX': -2050, 'movedZ': -2550, 'revertedX': -1750, 'revertedZ': -2250}"
+    },
+    {
+      "name": "TEST 8: Wall & Attached Openings Deletion and Undo",
+      "status": "PASSED",
+      "details": "{'initialWallsCount': 4, 'initialOpeningsCount': 2, 'wallsAfterDelete': 3, 'openingsAfterDelete': 1, 'wallsAfterUndo': 4, 'openingsAfterUndo': 2}"
+    },
+    {
+      "name": "TEST 9: Keyboard Shortcuts (Ctrl+Z, Ctrl+Y, Escape) & Input Protection",
+      "status": "PASSED",
+      "details": "{'undoStackBefore': 5, 'undoStackAfterInputKey': 5, 'inputProtected': True, 'countAfterAdd': 6, 'countAfterGlobalUndo': 5, 'countAfterGlobalRedo': 6, 'selectedBeforeEsc': None, 'selectedAfterEsc': None}"
+    },
+    {
+      "name": "TEST 10: 3D Room Extrude Geometry & Console Health",
+      "status": "PASSED",
+      "details": "Children: 5, Errors: []"
+    }
+  ],
+  "errors_found": []
+}

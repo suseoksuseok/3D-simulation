@@ -210,6 +210,21 @@ html, body {
   border-color: #3E414E;
 }
 
+.header-action-btn:disabled,
+.header-action-btn.disabled {
+  opacity: 0.38 !important;
+  cursor: not-allowed !important;
+  pointer-events: none !important;
+  border-color: var(--border-subtle) !important;
+}
+
+#canvas-2d.cursor-move { cursor: move !important; }
+#canvas-2d.cursor-crosshair { cursor: crosshair !important; }
+#canvas-2d.cursor-grab { cursor: grab !important; }
+#canvas-2d.cursor-grabbing { cursor: grabbing !important; }
+#canvas-2d.cursor-not-allowed { cursor: not-allowed !important; }
+#canvas-2d.cursor-default { cursor: default !important; }
+
 .divider-v {
   width: 1px;
   height: 20px;
@@ -1160,6 +1175,12 @@ input[type="color"] {
   background: var(--danger-red-soft);
 }
 
+.placed-item-row.selected {
+  border-color: var(--accent-indigo);
+  background: var(--accent-indigo-soft);
+  color: #FFFFFF;
+}
+
 .selected-item-card {
   display: flex;
   align-items: center;
@@ -1244,3 +1265,485 @@ input[type="color"] {
 .hidden {
   display: none !important;
 }
+
+
+/* ==========================================================================
+   SpaceCraft 3D — Mobile & Tablet Accessibility & Responsive Styles
+   - Touch-action optimization for WebGL and 2D canvas
+   - Slide-over Drawer Architecture for sidebars
+   - Floating Bottom Action Bar for thumb-friendly interaction
+   - Dedicated PC Mode vs Mobile Mode toggle states
+   ========================================================================== */
+
+/* Touch-action optimization */
+#three-canvas,
+#floorplan-canvas,
+.viewport-layer,
+#center-viewport {
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Device Mode Toggle Button in Header */
+.device-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.device-mode-toggle:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--accent-indigo);
+}
+
+.device-mode-toggle .device-icon-mobile {
+  display: none;
+}
+.device-mode-toggle .device-icon-pc {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #818CF8;
+}
+
+.device-mode-toggle.is-mobile .device-icon-pc {
+  display: none;
+}
+.device-mode-toggle.is-mobile .device-icon-mobile {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #38BDF8;
+}
+
+/* Mobile Hamburger Menu Button in Header */
+.mobile-menu-btn {
+  display: none;
+  padding: 6px 9px;
+}
+
+/* Drawer Close Buttons */
+.drawer-close-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.drawer-close-btn:hover {
+  background: var(--bg-card-hover);
+  color: var(--text-primary);
+  border-color: #4F46E5;
+}
+
+.sidebar-header-mobile {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Mobile Drawer Backdrop */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  top: 52px;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(3px);
+  z-index: 40;
+  transition: opacity 0.25s ease;
+}
+
+/* Floating Bottom Navigation for Mobile */
+.mobile-bottom-nav {
+  display: none;
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  background: rgba(24, 25, 28, 0.95);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--border-color);
+  z-index: 45;
+  justify-content: space-around;
+  align-items: center;
+  padding: 0 4px;
+}
+
+.mobile-nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 6px;
+  min-width: 54px;
+  min-height: 44px;
+  transition: all 0.15s ease;
+}
+
+.mobile-nav-item:active,
+.mobile-nav-item:hover {
+  color: #FFFFFF;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.mobile-nav-item.active {
+  color: #818CF8;
+}
+
+/* ==================== ACTIVE MOBILE MODE (FORCED VIA .device-mode-mobile) ==================== */
+.device-mode-mobile #top-header {
+  height: 48px;
+  min-height: 48px;
+  padding: 0 10px;
+}
+.device-mode-mobile .brand-badge,
+.device-mode-mobile .scale-indicator {
+  display: none !important;
+}
+.device-mode-mobile .brand-title {
+  font-size: 13.5px;
+}
+.device-mode-mobile .mobile-menu-btn {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 5px;
+}
+.device-mode-mobile .header-left,
+.device-mode-mobile .header-center,
+.device-mode-mobile .header-right {
+  gap: 6px;
+}
+.device-mode-mobile .mode-switch-group {
+  display: none !important;
+}
+.device-mode-mobile .header-right .toggle-chip span,
+.device-mode-mobile .header-right #btn-reset-camera span,
+.device-mode-mobile .header-right #btn-save-state span,
+.device-mode-mobile .header-right #btn-load-state span {
+  display: none;
+}
+.device-mode-mobile .header-right .divider-v:nth-of-type(2),
+.device-mode-mobile .header-right #btn-load-state {
+  display: none !important;
+}
+.device-mode-mobile #main-workspace {
+  height: calc(100vh - 48px);
+}
+.device-mode-mobile #left-sidebar {
+  position: fixed !important;
+  top: 48px !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  width: min(340px, 86vw) !important;
+  min-width: 0 !important;
+  z-index: 50 !important;
+  transform: translateX(-105%) !important;
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  box-shadow: none !important;
+  border-right: 1px solid var(--border-color) !important;
+}
+.device-mode-mobile #left-sidebar.mobile-open {
+  transform: translateX(0) !important;
+  box-shadow: 6px 0 28px rgba(0, 0, 0, 0.75) !important;
+}
+.device-mode-mobile .sidebar-header-mobile {
+  display: flex !important;
+}
+.device-mode-mobile .drawer-close-btn {
+  display: flex !important;
+}
+.device-mode-mobile #right-sidebar {
+  position: fixed !important;
+  right: 0 !important;
+  bottom: 56px !important;
+  left: 0 !important;
+  top: auto !important;
+  max-height: 72vh !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  z-index: 50 !important;
+  border-radius: 14px 14px 0 0 !important;
+  border-left: none !important;
+  border-top: 1px solid var(--border-color) !important;
+  transform: translateY(105%) !important;
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  box-shadow: none !important;
+}
+.device-mode-mobile #right-sidebar.mobile-open {
+  transform: translateY(0) !important;
+  box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.8) !important;
+}
+.device-mode-mobile #center-viewport {
+  width: 100vw !important;
+}
+.device-mode-mobile .mobile-bottom-nav {
+  display: flex !important;
+}
+.device-mode-mobile .viewport-hud-bottom {
+  bottom: 64px !important;
+  font-size: 11px;
+  padding: 5px 10px;
+  max-width: 92vw;
+  flex-wrap: wrap;
+  justify-content: center;
+  text-align: center;
+}
+.device-mode-mobile .viewport-hud-top-left {
+  top: 8px;
+  left: 8px;
+  gap: 5px;
+}
+.device-mode-mobile .hud-pill {
+  padding: 4px 9px;
+  font-size: 11px;
+}
+.device-mode-mobile .hud-tool-chips {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.device-mode-mobile .hud-tool-chip {
+  padding: 7px 11px;
+  font-size: 12px;
+  min-height: 36px;
+}
+.device-mode-mobile .primary-btn,
+.device-mode-mobile .secondary-btn,
+.device-mode-mobile .danger-btn {
+  min-height: 40px;
+}
+
+/* ==================== RESPONSIVE VIEWPORT (SCREEN <= 860PX) ==================== */
+@media (max-width: 860px) {
+  #top-header {
+    height: 48px;
+    min-height: 48px;
+    padding: 0 10px;
+  }
+
+  .brand-badge,
+  .scale-indicator {
+    display: none !important;
+  }
+
+  .brand-title {
+    font-size: 13.5px;
+  }
+
+  .mobile-menu-btn {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .header-left,
+  .header-center,
+  .header-right {
+    gap: 6px;
+  }
+
+  .mode-switch-group {
+    display: none !important;
+  }
+
+  .header-right .toggle-chip span,
+  .header-right #btn-reset-camera span,
+  .header-right #btn-save-state span,
+  .header-right #btn-load-state span {
+    display: none;
+  }
+
+  .header-right .divider-v:nth-of-type(2),
+  .header-right #btn-load-state {
+    display: none !important;
+  }
+
+  #main-workspace {
+    height: calc(100vh - 48px);
+  }
+
+  /* Left Sidebar Drawer */
+  #left-sidebar {
+    position: fixed;
+    top: 48px;
+    bottom: 0;
+    left: 0;
+    width: min(340px, 86vw);
+    min-width: 0;
+    z-index: 50;
+    transform: translateX(-105%);
+    transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: none;
+    border-right: 1px solid var(--border-color);
+  }
+
+  #left-sidebar.mobile-open {
+    transform: translateX(0);
+    box-shadow: 6px 0 28px rgba(0, 0, 0, 0.75);
+  }
+
+  .sidebar-header-mobile {
+    display: flex !important;
+  }
+
+  .drawer-close-btn {
+    display: flex !important;
+  }
+
+  /* Right Sidebar Bottom Sheet / Drawer */
+  #right-sidebar {
+    position: fixed;
+    right: 0;
+    bottom: 56px;
+    left: 0;
+    top: auto;
+    max-height: 72vh;
+    width: 100%;
+    min-width: 0;
+    z-index: 50;
+    border-radius: 14px 14px 0 0;
+    border-left: none;
+    border-top: 1px solid var(--border-color);
+    transform: translateY(105%);
+    transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: none;
+  }
+
+  #right-sidebar.mobile-open {
+    transform: translateY(0);
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.8);
+  }
+
+  /* Center Viewport full width */
+  #center-viewport {
+    width: 100vw;
+  }
+
+  /* Floating Bottom Nav display */
+  .mobile-bottom-nav {
+    display: flex !important;
+  }
+
+  /* HUD positioning above mobile bottom bar */
+  .viewport-hud-bottom {
+    bottom: 64px !important;
+    font-size: 11px;
+    padding: 5px 10px;
+    max-width: 92vw;
+    flex-wrap: wrap;
+    justify-content: center;
+    text-align: center;
+  }
+
+  .viewport-hud-top-left {
+    top: 8px;
+    left: 8px;
+    gap: 5px;
+  }
+
+  .hud-pill {
+    padding: 4px 9px;
+    font-size: 11px;
+  }
+
+  /* Larger touch targets */
+  .hud-tool-chips {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .hud-tool-chip {
+    padding: 7px 11px;
+    font-size: 12px;
+    min-height: 36px;
+  }
+
+  .primary-btn,
+  .secondary-btn,
+  .danger-btn {
+    min-height: 40px;
+  }
+}
+
+/* Explicit PC Mode Override (keeps desktop sidebars intact even when resized) */
+.device-mode-pc #top-header {
+  height: 52px;
+}
+.device-mode-pc .mode-switch-group {
+  display: flex !important;
+}
+.device-mode-pc .mobile-menu-btn {
+  display: none !important;
+}
+.device-mode-pc .sidebar-header-mobile,
+.device-mode-pc .drawer-close-btn {
+  display: none !important;
+}
+.device-mode-pc #left-sidebar {
+  position: static !important;
+  width: 356px !important;
+  min-width: 356px !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+.device-mode-pc #right-sidebar {
+  position: static !important;
+  width: 320px !important;
+  min-width: 320px !important;
+  max-height: none !important;
+  border-radius: 0 !important;
+  border-left: 1px solid var(--border-color) !important;
+  border-top: none !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+.device-mode-pc #center-viewport {
+  width: auto !important;
+}
+.device-mode-pc .mobile-bottom-nav {
+  display: none !important;
+}
+.device-mode-pc .drawer-backdrop {
+  display: none !important;
+}
+.device-mode-pc .viewport-hud-bottom {
+  bottom: 12px !important;
+}
+
+#floorplan-canvas.cursor-pan { cursor: grab !important; }
+#floorplan-canvas.cursor-pan:active { cursor: grabbing !important; }
+

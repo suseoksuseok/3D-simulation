@@ -1,0 +1,77 @@
+{
+  "tests_run": 14,
+  "tests_passed": 14,
+  "tests_failed": 0,
+  "details": [
+    {
+      "test": "3D & 2D Canvas Initialization",
+      "status": "PASSED",
+      "message": "Both WebGL and 2D floorplan canvases are initialized"
+    },
+    {
+      "test": "Preset Loading (Studio, 1.5Room, Apt, LShape)",
+      "status": "PASSED",
+      "message": "All presets load geometry and update room name"
+    },
+    {
+      "test": "Persistent Placed List When Selected (FIX 7)",
+      "status": "PASSED",
+      "message": "Found 4 items in persistent placed list while furniture is selected"
+    },
+    {
+      "test": "Switch Furniture via Placed List (FIX 7)",
+      "status": "PASSED",
+      "message": "Switched to '데스크테리어 모션 데스크' directly from placed list"
+    },
+    {
+      "test": "Color Picker Live Update (FIX 4)",
+      "status": "PASSED",
+      "message": "Hex color updated to #3B82F6"
+    },
+    {
+      "test": "2D Canvas Cursor Mode",
+      "status": "PASSED",
+      "message": "Canvas class is 'cursor-select'"
+    },
+    {
+      "test": "2D Wall Drawing Tool",
+      "status": "PASSED",
+      "message": "Walls count after drawing: 5"
+    },
+    {
+      "test": "2D Wall Accurate Erase (FIX 2)",
+      "status": "PASSED",
+      "message": "Walls count decreased to 4 upon clicking along segment"
+    },
+    {
+      "test": "Clear 2D Walls Resets Floor Polygon (FIX 3)",
+      "status": "PASSED",
+      "message": "state.floorPolygon length is 0"
+    },
+    {
+      "test": "Robust LLM JSON Extraction (FIX 1)",
+      "status": "PASSED",
+      "message": "Successfully extracts JSON from conversational LLM response and raw JSON"
+    },
+    {
+      "test": "AI Generator 3D Assembly & Vault",
+      "status": "PASSED",
+      "message": "Created AI furniture and saved in Vault (vault items: 1)"
+    },
+    {
+      "test": "GLB Model Caching & Re-placement (FIX 5)",
+      "status": "PASSED",
+      "message": "Successfully cloned and placed GLB model from cache"
+    },
+    {
+      "test": "Escape Key Deselection (FIX 9)",
+      "status": "PASSED",
+      "message": "Selected furniture ID after Escape is None"
+    },
+    {
+      "test": "900mm Door Swing Collision Detection",
+      "status": "PASSED",
+      "message": "Furniture inside door swing zone correctly triggers isColliding warning"
+    }
+  ]
+}
