@@ -248,8 +248,6 @@ def run_ai_tests():
 
             await window.triggerAIFurnitureGeneration();
 
-            const presetSelectRemoved = document.getElementById('ai-furn-shape') === null;
-
             const finalCount = window.state.furnitureList.length;
             const aiItems = window.state.furnitureList.filter(f => f.name === '연속생성 가구 1호' || f.name === '연속생성 가구 2호');
             const item1 = aiItems.find(f => f.name === '연속생성 가구 1호');
@@ -275,7 +273,7 @@ def run_ai_tests():
         }""")
         t4_ok = (
             t4_res["addedCount"] == 2 and
-            "다음 가구 이미지를 업로드할 수 있습니다" in t4_res["toastAfter1"] and
+            "다음 이미지를 업로드할 수 있습니다" in t4_res["toastAfter1"] and
             t4_res["autoResetBase64After1"] is None and
             t4_res["autoResetPromptAfter1"] == "" and
             t4_res["autoResetNameAfter1"] == "" and
@@ -297,23 +295,150 @@ def run_ai_tests():
             const isLocked = window.state.isGeneratingAI;
             const isBtnDisabled = document.getElementById('btn-generate-ai-furniture').disabled;
             const isLoadingHidden = document.getElementById('ai-loading-box').classList.contains('hidden');
+            const toastText = document.getElementById('toast-notification').textContent;
 
-            return { isLocked, isBtnDisabled, isLoadingHidden };
+            window.state.aiConfig.provider = 'smart_preset';
+
+            return {
+                isLocked,
+                isBtnDisabled,
+                isLoadingHidden,
+                toastText
+            };
         }""")
         t5_ok = (
             t5_res["isLocked"] is False and
             t5_res["isBtnDisabled"] is False and
             t5_res["isLoadingHidden"] is True and
+            "내장 비전 분석기로" in t5_res["toastText"] and
             len(console_errors) == 0
         )
-        record("TEST 5: Finally Block Lock Release & Error Recovery Guarantee", t5_ok, str(t5_res))
+        record("TEST 5: Lock Release (finally) & Transparent Fallback Notice on API Error", t5_ok, str(t5_res))
+
+        # TEST 6: Computer/Monitor Photo Upload -> Generates 3D Computer/Monitor Setup (NEVER a computer-colored table!)
+        t6_res = page.evaluate("""async () => {
+            // Draw a realistic computer monitor photo on a 128x128 canvas:
+            // White background (#F8FAFC), silver/gray monitor bezel (#94A3B8), dark screen (#0F172A), narrow stand neck, and base
+            const c = document.createElement('canvas');
+            c.width = 128; c.height = 128;
+            const ctx = c.getContext('2d');
+            ctx.fillStyle = '#F8FAFC'; // studio background
+            ctx.fillRect(0, 0, 128, 128);
+
+            // Monitor outer bezel (x: 16..112, y: 14..78)
+            ctx.fillStyle = '#64748B';
+            ctx.fillRect(16, 14, 96, 64);
+
+            // Monitor dark display screen (x: 22..106, y: 19..71)
+            ctx.fillStyle = '#0F172A';
+            ctx.fillRect(22, 19, 84, 52);
+
+            // Stand neck (narrow! x: 56..72, y: 78..102)
+            ctx.fillStyle = '#475569';
+            ctx.fillRect(56, 78, 16, 24);
+
+            // Stand base (x: 36..92, y: 102..112)
+            ctx.fillStyle = '#334155';
+            ctx.fillRect(36, 102, 56, 10);
+
+            const b64 = c.toDataURL('image/png').split(',')[1];
+            const bin = atob(b64);
+            const arr = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+            // Notice we give it a generic filename ('IMG_2026.png') and NO text prompt to prove visual pixel detection works!
+            const compFile = new File([new Blob([arr], { type: 'image/png' })], 'IMG_2026.png', { type: 'image/png' });
+
+            window.handleAIImageUpload(compFile);
+            await new Promise(r => setTimeout(r, 200));
+
+            const statsAfterUpload = window.state.aiImageStats;
+            const detectedMonitorByPixel = statsAfterUpload ? statsAfterUpload.isMonitorLike : false;
+
+            // Even if Local AI (ollama/LM Studio) is selected while server is off, it must NOT generate a round table!
+            window.state.aiConfig.provider = 'ollama';
+            await window.triggerAIFurnitureGeneration();
+            window.state.aiConfig.provider = 'smart_preset';
+
+            const latestItem = window.state.furnitureList[window.state.furnitureList.length - 1];
+            const partNames = latestItem.blueprintData.parts.map(p => p.name);
+
+            return {
+                detectedMonitorByPixel,
+                generatedShape: latestItem.shape,
+                partCount: partNames.length,
+                partNames,
+                hasScreenPart: partNames.includes('monitor_display_screen'),
+                hasStandNeck: partNames.includes('monitor_stand_neck'),
+                isNotRoundTable: latestItem.shape !== 'round_slanted_table'
+            };
+        }""")
+        t6_ok = (
+            t6_res["detectedMonitorByPixel"] is True and
+            t6_res["generatedShape"] == "computer_monitor_setup" and
+            t6_res["hasScreenPart"] is True and
+            t6_res["hasStandNeck"] is True and
+            t6_res["isNotRoundTable"] is True
+        )
+        record("TEST 6: Computer Photo Visual Detection -> 3D Monitor/PC Setup (No Table Fallback)", t6_ok, str(t6_res))
+
+        # TEST 7: Local AI LM Studio (Port 1234 OpenAI-compat Vision) & Ollama (Port 11434) Dual Protocol Support
+        t7_res = page.evaluate("""async () => {
+            const origFetch = window.fetch;
+            let capturedUrl = '';
+            let capturedBody = null;
+
+            window.fetch = async (url, options) => {
+                capturedUrl = url;
+                capturedBody = options && options.body ? JSON.parse(options.body) : null;
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        choices: [{
+                            message: {
+                                content: JSON.stringify({
+                                    parts: [
+                                        { name: 'lmstudio_monitor_panel', shape: 'box', size: [600, 380, 25], position: [0, 350, 0], rotation: [0,0,0], color: '#111827', materialType: 'glass' }
+                                    ]
+                                })
+                            }
+                        }]
+                    })
+                };
+            };
+
+            try {
+                window.state.aiConfig.provider = 'ollama';
+                window.state.aiConfig.ollamaUrl = 'http://localhost:1234/v1/chat/completions';
+                window.state.aiConfig.ollamaModel = 'google/gemma-4-12b-qat';
+
+                const bp = await window.callAIBlueprintAPI('BASE64_COMP_IMG', 'image/png', '데스크탑 컴퓨터', 700, 500, 520, 'computer_monitor_setup', '');
+                const hasImageUrlPart = JSON.stringify(capturedBody).includes('data:image/png;base64,BASE64_COMP_IMG');
+
+                return {
+                    capturedUrl,
+                    modelSent: capturedBody ? capturedBody.model : null,
+                    hasImageUrlPart,
+                    returnedPartName: bp && bp.parts && bp.parts[0] ? bp.parts[0].name : null
+                };
+            } finally {
+                window.fetch = origFetch;
+                window.state.aiConfig.provider = 'smart_preset';
+            }
+        }""")
+        t7_ok = (
+            t7_res["capturedUrl"] == "http://localhost:1234/v1/chat/completions" and
+            t7_res["modelSent"] == "google/gemma-4-12b-qat" and
+            t7_res["hasImageUrlPart"] is True and
+            t7_res["returnedPartName"] == "lmstudio_monitor_panel"
+        )
+        record("TEST 7: LM Studio (1234 /v1/chat/completions + google/gemma-4-12b-qat) Vision Protocol", t7_ok, str(t7_res))
 
         browser.close()
 
-    print(f"\n==========================================")
-    print(f"AI CONSECUTIVE GENERATION TESTS: {report['passed']}/{report['total']} PASSED")
-    print(f"==========================================")
-    assert report["failed"] == 0, f"{report['failed']} tests failed!"
+    print(f"\n=== AI VISION & CONSECUTIVE GENERATION TEST SUMMARY: {report['passed']}/{report['total']} PASSED ===")
+    if report["failed"] > 0:
+        sys.exit(1)
 
 if __name__ == "__main__":
     run_ai_tests()

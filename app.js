@@ -55,8 +55,8 @@
       provider: 'gemini', // 'gemini' | 'openai' | 'ollama' | 'smart_preset'
       geminiApiKey: '',
       openaiApiKey: '',
-      ollamaUrl: 'http://localhost:11434/api/generate',
-      ollamaModel: 'llama3.2-vision'
+      ollamaUrl: 'http://localhost:1234/v1/chat/completions',
+      ollamaModel: 'google/gemma-4-12b-qat'
     },
 
     // AI Upload Temp State (Cleaned up via resetAIGeneratorState)
@@ -614,14 +614,81 @@
     } else if (provider === 'ollama') {
       cloudKeyWrap.classList.add('hidden');
       ollamaWrap.classList.remove('hidden');
-      document.getElementById('ai-ollama-url').value = state.aiConfig.ollamaUrl || 'http://localhost:11434/api/generate';
-      document.getElementById('ai-ollama-model').value = state.aiConfig.ollamaModel || 'llama3.2-vision';
-      statusPill.textContent = `Ollama: ${state.aiConfig.ollamaModel || 'vision'}`;
+      document.getElementById('ai-ollama-url').value = state.aiConfig.ollamaUrl || 'http://localhost:1234/v1/chat/completions';
+      document.getElementById('ai-ollama-model').value = state.aiConfig.ollamaModel || 'google/gemma-4-12b-qat';
+      statusPill.textContent = `Local AI: ${state.aiConfig.ollamaModel || 'vision'}`;
     } else {
       cloudKeyWrap.classList.add('hidden');
       ollamaWrap.classList.add('hidden');
-      statusPill.textContent = '스마트 파라미터 프리셋';
+      statusPill.textContent = '내장 비전 실루엣 분석';
     }
+  }
+
+  async function testLocalAIConnection() {
+    const statusMsg = document.getElementById('local-ai-status-msg');
+    const urlInput = document.getElementById('ai-ollama-url');
+    const modelInput = document.getElementById('ai-ollama-model');
+    if (statusMsg) {
+      statusMsg.style.color = '#93C5FD';
+      statusMsg.textContent = '로컬 서버 탐색 중 (1234 / 11434)...';
+    }
+
+    // 1. Try LM Studio OpenAI-compatible server on port 1234
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2200);
+      const res = await fetch('http://localhost:1234/v1/models', { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = await res.json();
+        const models = Array.isArray(data?.data) ? data.data.map((m) => m.id) : [];
+        const chosen = models.find((id) => /gemma|vl|vision|llava|pixtral|qwen|minicpm/i.test(id)) || models[0] || 'google/gemma-4-12b-qat';
+        state.aiConfig.ollamaUrl = 'http://localhost:1234/v1/chat/completions';
+        state.aiConfig.ollamaModel = chosen;
+        if (urlInput) urlInput.value = state.aiConfig.ollamaUrl;
+        if (modelInput) modelInput.value = state.aiConfig.ollamaModel;
+        saveAIConfig();
+        syncAIConfigUI();
+        if (statusMsg) {
+          statusMsg.style.color = '#34D399';
+          statusMsg.textContent = `✅ LM Studio 연결됨 (${chosen})`;
+        }
+        showToast(`✅ LM Studio 로컬 서버(포트 1234) 연결 성공! 모델: ${chosen}`);
+        return true;
+      }
+    } catch (_) {}
+
+    // 2. Try Ollama server on port 11434
+    try {
+      const ctrl2 = new AbortController();
+      const timer2 = setTimeout(() => ctrl2.abort(), 2200);
+      const res2 = await fetch('http://localhost:11434/api/tags', { signal: ctrl2.signal });
+      clearTimeout(timer2);
+      if (res2.ok) {
+        const data2 = await res2.json();
+        const models = Array.isArray(data2?.models) ? data2.models.map((m) => m.name) : [];
+        const chosen = models.find((id) => /vision|llava|gemma|minicpm|qwen/i.test(id)) || models[0] || 'llama3.2-vision';
+        state.aiConfig.ollamaUrl = 'http://localhost:11434/api/generate';
+        state.aiConfig.ollamaModel = chosen;
+        if (urlInput) urlInput.value = state.aiConfig.ollamaUrl;
+        if (modelInput) modelInput.value = state.aiConfig.ollamaModel;
+        saveAIConfig();
+        syncAIConfigUI();
+        if (statusMsg) {
+          statusMsg.style.color = '#34D399';
+          statusMsg.textContent = `✅ Ollama 연결됨 (${chosen})`;
+        }
+        showToast(`✅ Ollama 로컬 서버(포트 11434) 연결 성공! 모델: ${chosen}`);
+        return true;
+      }
+    } catch (_) {}
+
+    if (statusMsg) {
+      statusMsg.style.color = '#F87171';
+      statusMsg.textContent = '❌ 서버 꺼짐 (LM Studio에서 Start Server 필요)';
+    }
+    showToast('⚠️ 로컬 AI 서버(LM Studio 1234 / Ollama 11434)가 실행 중이지 않습니다. 서버가 꺼져 있으면 내장 비전 실루엣 분석기가 작동합니다.');
+    return false;
   }
 
   // ==================== THREE.JS SETUP ====================
@@ -1497,12 +1564,236 @@
     return group;
   }
 
-  // ==================== [기능 3-1] 스마트 파라미터 프리셋 블루프린트 생성기 ====================
-  function generateSmartBlueprint(shapeKey, W, D, H, color, matType) {
+  // ==================== [기능 3-1] 이미지 실루엣 & 다중 객체 3D 블루프린트 합성기 ====================
+  function generateSmartBlueprint(shapeKey, W, D, H, color, matType, extraOpts = {}) {
     const parts = [];
     const mainColor = color || '#8B6F4E';
-    const subColor = '#2B2D35';
+    const subColor = extraOpts.subColor || state.aiExtractedSubHex || '#2B2D35';
+    const screenColor = extraOpts.screenColor || state.aiImageStats?.screenColor || '#111827';
     const primaryMat = matType || 'wood';
+    const imgStats = extraOpts.imageStats || state.aiImageStats || null;
+
+    if (shapeKey === 'computer_monitor_setup') {
+      // 컴퓨터 / 모니터 / 데스크탑 PC 입체 조립 (베젤 프레임 + 디스플레이 패널 + 스탠드 넥 + 베이스 + 본체/키보드)
+      const hasTower = W >= 580;
+      const monW = hasTower ? Math.round(W * 0.68) : Math.round(W * 0.92);
+      const monX = hasTower ? -Math.round(W * 0.14) : 0;
+      const baseH = Math.max(12, Math.round(H * 0.035));
+      const neckH = Math.max(80, Math.round(H * 0.24));
+      const screenH = Math.max(220, H - neckH - baseH);
+      const screenY = baseH + neckH + screenH / 2;
+      const panelThick = Math.max(22, Math.round(D * 0.08));
+      const bezelT = Math.max(10, Math.round(monW * 0.022));
+
+      // 1. 모니터 스탠드 하단 베이스 플레이트
+      parts.push({
+        name: 'monitor_stand_base',
+        shape: 'box',
+        size: [Math.round(monW * 0.42), baseH, Math.round(D * 0.48)],
+        position: [monX, baseH / 2, -Math.round(D * 0.08)],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+
+      // 2. 모니터 스탠드 기둥(Neck)
+      parts.push({
+        name: 'monitor_stand_neck',
+        shape: 'cylinder',
+        size: [Math.max(16, Math.round(monW * 0.035)), Math.max(22, Math.round(monW * 0.045)), neckH + 30],
+        position: [monX, baseH + (neckH + 30) / 2, -Math.round(D * 0.14)],
+        rotation: [-6, 0, 0],
+        color: subColor,
+        materialType: 'metal'
+      });
+
+      // 3. 모니터 외곽 하우징 / 베젤 후면 프레임
+      parts.push({
+        name: 'monitor_housing_back',
+        shape: 'box',
+        size: [monW, screenH, panelThick],
+        position: [monX, screenY, -Math.round(D * 0.08)],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'plastic'
+      });
+
+      // 4. 모니터 전면 디스플레이 액정 패널
+      parts.push({
+        name: 'monitor_display_screen',
+        shape: 'box',
+        size: [monW - bezelT * 2, screenH - bezelT * 2, 6],
+        position: [monX, screenY + 2, -Math.round(D * 0.08) + panelThick / 2 + 2],
+        rotation: [0, 0, 0],
+        color: screenColor,
+        materialType: 'glass'
+      });
+
+      // 5. 모니터 하단 친(Chin) 베젤 바
+      parts.push({
+        name: 'monitor_bottom_bezel',
+        shape: 'box',
+        size: [monW, bezelT * 1.4, panelThick + 6],
+        position: [monX, screenY - screenH / 2 + bezelT * 0.7, -Math.round(D * 0.08) + 2],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'metal'
+      });
+
+      // 6. 전면 키보드 & 마우스
+      const kbW = Math.min(360, Math.round(monW * 0.65));
+      const kbD = Math.min(130, Math.round(D * 0.26));
+      parts.push({
+        name: 'mechanical_keyboard',
+        shape: 'box',
+        size: [kbW, 18, kbD],
+        position: [monX - 25, 9, Math.round(D * 0.24)],
+        rotation: [4, 0, 0],
+        color: mainColor,
+        materialType: 'plastic'
+      });
+      parts.push({
+        name: 'wireless_mouse',
+        shape: 'cylinder',
+        size: [28, 30, 22],
+        position: [monX + kbW / 2 + 45, 11, Math.round(D * 0.24)],
+        rotation: [0, 0, 0],
+        color: subColor,
+        materialType: 'plastic'
+      });
+
+      // 7. 데스크탑 PC 타워 본체 (우측 배치)
+      if (hasTower) {
+        const towerW = Math.max(140, Math.round(W * 0.24));
+        const towerH = Math.round(H * 0.88);
+        const towerD = Math.round(D * 0.72);
+        const towerX = Math.round(W / 2 - towerW / 2 - 10);
+
+        parts.push({
+          name: 'pc_tower_chassis',
+          shape: 'box',
+          size: [towerW, towerH, towerD],
+          position: [towerX, towerH / 2, 0],
+          rotation: [0, 0, 0],
+          color: mainColor,
+          materialType: 'metal'
+        });
+        parts.push({
+          name: 'pc_tempered_glass_side',
+          shape: 'box',
+          size: [6, Math.round(towerH * 0.86), Math.round(towerD * 0.86)],
+          position: [towerX - towerW / 2 - 2, towerH / 2, 0],
+          rotation: [0, 0, 0],
+          color: screenColor,
+          materialType: 'glass'
+        });
+        parts.push({
+          name: 'pc_front_led_accent',
+          shape: 'box',
+          size: [Math.round(towerW * 0.18), Math.round(towerH * 0.78), 6],
+          position: [towerX, towerH / 2, towerD / 2 + 3],
+          rotation: [0, 0, 0],
+          color: '#38BDF8',
+          materialType: 'glass'
+        });
+      }
+      return { parts };
+    } else if (shapeKey === 'laptop_computer') {
+      const deckThick = Math.max(14, Math.round(H * 0.06));
+      const lidH = Math.max(180, H - deckThick);
+      parts.push({
+        name: 'laptop_base_deck',
+        shape: 'box',
+        size: [W, deckThick, D],
+        position: [0, deckThick / 2, 0],
+        rotation: [0, 0, 0],
+        color: mainColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'laptop_keyboard_well',
+        shape: 'box',
+        size: [Math.round(W * 0.84), 4, Math.round(D * 0.48)],
+        position: [0, deckThick + 1, -Math.round(D * 0.08)],
+        rotation: [0, 0, 0],
+        color: '#1E1F24',
+        materialType: 'plastic'
+      });
+      parts.push({
+        name: 'laptop_display_lid',
+        shape: 'box',
+        size: [W, lidH, 10],
+        position: [0, deckThick + lidH / 2, -Math.round(D * 0.44)],
+        rotation: [-11, 0, 0],
+        color: mainColor,
+        materialType: 'metal'
+      });
+      parts.push({
+        name: 'laptop_screen_panel',
+        shape: 'box',
+        size: [Math.round(W * 0.92), Math.round(lidH * 0.88), 4],
+        position: [0, deckThick + lidH / 2, -Math.round(D * 0.44) + 6],
+        rotation: [-11, 0, 0],
+        color: screenColor,
+        materialType: 'glass'
+      });
+      return { parts };
+    } else if (shapeKey === 'image_silhouette_3d' && imgStats && Array.isArray(imgStats.slices) && imgStats.slices.length > 0) {
+      // 업로드된 이미지의 12단 수평 슬라이스 실루엣 & 부위별 색상 데이터를 기반으로 직접 3D 컨투어 메쉬 복원
+      const slices = imgStats.slices;
+      const numSlices = slices.length;
+      const sliceH = H / numSlices;
+
+      slices.forEach((s, idx) => {
+        // 이미지 상단(idx=0)이 3D 상단(y=H), 이미지 하단(idx=numSlices-1)이 3D 바닥(y=0)에 대응
+        const yCenter = H - (idx + 0.5) * sliceH;
+        const wRatio = Math.max(0.12, Math.min(1.0, s.widthRatio || 0.5));
+        const dRatio = Math.max(0.18, Math.min(1.0, s.fillRatio || wRatio));
+        const partW = Math.round(W * wRatio);
+        const partD = Math.round(D * dRatio);
+        const offsetX = Math.round((s.centerXRatio || 0) * W * 0.5);
+        const partColor = s.color || mainColor;
+
+        if (s.segmentCount >= 2 && idx >= Math.floor(numSlices * 0.55)) {
+          // 하단부가 여러 갈래(다리/양측 지지대)로 나뉘어 있는 실루엣일 경우 좌우 대칭 다리/기둥 생성
+          const legW = Math.max(24, Math.round(partW * 0.18));
+          const legD = Math.max(24, Math.round(D * 0.18));
+          const spanX = Math.max(legW, Math.round(partW * 0.42));
+          parts.push({
+            name: `silhouette_leg_left_${idx}`,
+            shape: 'box',
+            size: [legW, Math.ceil(sliceH + 2), legD],
+            position: [offsetX - spanX, yCenter, 0],
+            rotation: [0, 0, 0],
+            color: partColor,
+            materialType: primaryMat
+          });
+          parts.push({
+            name: `silhouette_leg_right_${idx}`,
+            shape: 'box',
+            size: [legW, Math.ceil(sliceH + 2), legD],
+            position: [offsetX + spanX, yCenter, 0],
+            rotation: [0, 0, 0],
+            color: partColor,
+            materialType: primaryMat
+          });
+        } else {
+          const useCylinder = imgStats.isRoundSymmetric && wRatio > 0.35;
+          parts.push({
+            name: `silhouette_tier_${idx + 1}`,
+            shape: useCylinder ? 'cylinder' : 'box',
+            size: useCylinder
+              ? [Math.round(partW / 2), Math.round(partW / 2), Math.ceil(sliceH + 2)]
+              : [partW, Math.ceil(sliceH + 2), partD],
+            position: [offsetX, yCenter, 0],
+            rotation: [0, 0, 0],
+            color: partColor,
+            materialType: primaryMat
+          });
+        }
+      });
+      return { parts };
+    }
 
     if (shapeKey === 'round_slanted_table') {
       const topThick = Math.min(38, H * 0.08);
@@ -1954,28 +2245,77 @@
       const rawText = data?.choices?.[0]?.message?.content;
       return extractJsonFromAiResponse(rawText);
     } else if (provider === 'ollama') {
-      const url = state.aiConfig.ollamaUrl || 'http://localhost:11434/api/generate';
-      const model = state.aiConfig.ollamaModel || 'llama3.2-vision';
+      const configuredUrl = (state.aiConfig.ollamaUrl || 'http://localhost:1234/v1/chat/completions').trim();
+      const configuredModel = (state.aiConfig.ollamaModel || 'google/gemma-4-12b-qat').trim();
 
-      const payload = {
-        model,
-        prompt: systemInstruction + '\n\n' + userTextPrompt,
-        stream: false,
-        format: 'json',
-        ...(cleanBase64 ? { images: [cleanBase64] } : {})
-      };
-
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!res.ok) {
-        throw new Error(`Ollama Server Error (${res.status}). 로컬 서버가 실행 중인지 확인하세요.`);
+      // OpenAI 호환 엔드포인트(LM Studio: 1234 /v1/chat/completions)와 Ollama 엔드포인트(:11434 /api/generate, /api/chat) 모두 자동 호환
+      async function tryLocalEndpoint(targetUrl, targetModel) {
+        const isOpenAICompat = targetUrl.includes('/v1/chat/completions') || targetUrl.includes(':1234');
+        if (isOpenAICompat) {
+          const endpoint = targetUrl.includes('/v1/') ? targetUrl : targetUrl.replace(/\/+$/, '') + '/v1/chat/completions';
+          const contentArr = [{ type: 'text', text: systemInstruction + '\n\n' + userTextPrompt }];
+          if (cleanBase64) {
+            contentArr.push({
+              type: 'image_url',
+              image_url: { url: `data:${cleanMime};base64,${cleanBase64}` }
+            });
+          }
+          const payload = {
+            model: targetModel || 'google/gemma-4-12b-qat',
+            messages: [
+              { role: 'user', content: contentArr }
+            ],
+            temperature: 0.2,
+            max_tokens: 1024,
+            stream: false
+          };
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            const errTxt = await res.text().catch(() => '');
+            throw new Error(`LM Studio / Local Server (${res.status}): ${errTxt || '응답 오류'}`);
+          }
+          const data = await res.json();
+          const rawText = data?.choices?.[0]?.message?.content || data?.response;
+          return extractJsonFromAiResponse(rawText);
+        } else {
+          const payload = {
+            model: targetModel || 'llama3.2-vision',
+            prompt: systemInstruction + '\n\n' + userTextPrompt,
+            stream: false,
+            format: 'json',
+            ...(cleanBase64 ? { images: [cleanBase64] } : {})
+          };
+          const res = await fetch(targetUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            throw new Error(`Ollama Server Error (${res.status})`);
+          }
+          const data = await res.json();
+          const rawText = data?.response || data?.message?.content;
+          return extractJsonFromAiResponse(rawText);
+        }
       }
-      const data = await res.json();
-      const rawText = data?.response || data?.message?.content;
-      return extractJsonFromAiResponse(rawText);
+
+      try {
+        return await tryLocalEndpoint(configuredUrl, configuredModel);
+      } catch (firstErr) {
+        // 설정된 URL 연결 실패 시 대체 로컬 포트(1234 <-> 11434) 자동 폴백 시도
+        const fallbackUrl = configuredUrl.includes('1234')
+          ? 'http://localhost:11434/api/generate'
+          : 'http://localhost:1234/v1/chat/completions';
+        try {
+          return await tryLocalEndpoint(fallbackUrl, configuredModel);
+        } catch (_) {
+          throw new Error(`로컬 AI 서버(LM Studio 1234 / Ollama 11434)가 켜져 있지 않습니다. LM Studio 좌측 [Developer] 탭에서 [Start Server]를 켜주세요.`);
+        }
+      }
     } else {
       return null;
     }
@@ -2310,40 +2650,128 @@
         ctx.clearRect(0, 0, 128, 128);
         ctx.drawImage(img, 0, 0, 128, 128);
 
-        // 중앙 영역(32..96) 주 색상 추출
-        const imgData = ctx.getImageData(32, 32, 64, 64).data;
-        let rSum = 0, gSum = 0, bSum = 0, validCount = 0;
-        let rSubSum = 0, gSubSum = 0, bSubSum = 0, subCount = 0;
+        const fullData = ctx.getImageData(0, 0, 128, 128).data;
 
-        for (let i = 0; i < imgData.length; i += 4) {
-          const r = imgData[i];
-          const g = imgData[i + 1];
-          const b = imgData[i + 2];
-          const a = imgData[i + 3];
+        // 1. 네 모서리(Corner) 픽셀 평균으로 배경색 추정 (전경/배경 분리 마스크 생성)
+        const cornerCoords = [
+          [2, 2], [125, 2], [2, 125], [125, 125],
+          [6, 2], [2, 6], [121, 2], [125, 6]
+        ];
+        let bgR = 0, bgG = 0, bgB = 0, bgA = 0;
+        cornerCoords.forEach(([cx, cy]) => {
+          const idx = (cy * 128 + cx) * 4;
+          bgR += fullData[idx];
+          bgG += fullData[idx + 1];
+          bgB += fullData[idx + 2];
+          bgA += fullData[idx + 3];
+        });
+        bgR /= cornerCoords.length;
+        bgG /= cornerCoords.length;
+        bgB /= cornerCoords.length;
+        bgA /= cornerCoords.length;
 
-          if (a < 128) continue;
-          if (r < 28 && g < 28 && b < 28) continue;
-          if (r > 238 && g > 238 && b > 238) continue;
-
-          rSum += r;
-          gSum += g;
-          bSum += b;
-          validCount++;
+        function isForegroundPixel(px, py) {
+          const idx = (py * 128 + px) * 4;
+          const r = fullData[idx], g = fullData[idx + 1], b = fullData[idx + 2], a = fullData[idx + 3];
+          if (a < 80) return false;
+          if (bgA < 80) return a >= 80;
+          const dist = Math.hypot(r - bgR, g - bgG, b - bgB);
+          return dist > 26;
         }
 
-        // 하단부(다리/프레임 영역) 보조 색상 추출
-        const botData = ctx.getImageData(24, 88, 80, 32).data;
-        for (let i = 0; i < botData.length; i += 4) {
-          const r = botData[i];
-          const g = botData[i + 1];
-          const b = botData[i + 2];
-          const a = botData[i + 3];
-          if (a < 128) continue;
-          if (r > 238 && g > 238 && b > 238) continue;
-          rSubSum += r;
-          gSubSum += g;
-          bSubSum += b;
-          subCount++;
+        // 2. 12단 수평 슬라이스(Horizontal Slice) 실루엣, 폭 비율, 분절 수(다리 감지), 부위별 대표 색상 추출
+        const NUM_SLICES = 12;
+        const slices = [];
+        let rSum = 0, gSum = 0, bSum = 0, validCount = 0;
+        let rSubSum = 0, gSubSum = 0, bSubSum = 0, subCount = 0;
+        let rScreenSum = 0, gScreenSum = 0, bScreenSum = 0, screenCount = 0;
+        let darkScreenPixels = 0, midScreenAreaPixels = 0;
+
+        for (let s = 0; s < NUM_SLICES; s++) {
+          const yStart = Math.floor((s * 128) / NUM_SLICES);
+          const yEnd = Math.floor(((s + 1) * 128) / NUM_SLICES);
+          let minX = 128, maxX = -1, fgCount = 0;
+          let sr = 0, sg = 0, sb = 0, sc = 0;
+          let totalSegments = 0, sampledRows = 0;
+
+          for (let y = yStart; y < yEnd; y++) {
+            let inSeg = false, rowSegs = 0;
+            for (let x = 4; x < 124; x++) {
+              const idx = (y * 128 + x) * 4;
+              const r = fullData[idx], g = fullData[idx + 1], b = fullData[idx + 2], a = fullData[idx + 3];
+              const fg = isForegroundPixel(x, y);
+
+              // 상·중단 중앙부(모니터 액정 영역: x 24..104, y 16..76) 픽셀 분석
+              if (x >= 24 && x <= 104 && y >= 16 && y <= 76 && a >= 128) {
+                midScreenAreaPixels++;
+                const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                const blueTint = b - Math.max(r, g);
+                if (lum < 85 || blueTint > 18) {
+                  darkScreenPixels++;
+                  rScreenSum += r; gScreenSum += g; bScreenSum += b;
+                  screenCount++;
+                }
+              }
+
+              if (fg) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                fgCount++;
+                sr += r; sg += g; sb += b; sc++;
+
+                if (s >= 2 && s <= 8) {
+                  rSum += r; gSum += g; bSum += b; validCount++;
+                } else if (s >= 9) {
+                  rSubSum += r; gSubSum += g; bSubSum += b; subCount++;
+                }
+                if (!inSeg) {
+                  inSeg = true;
+                  rowSegs++;
+                }
+              } else {
+                inSeg = false;
+              }
+            }
+            if (rowSegs > 0) {
+              totalSegments += rowSegs;
+              sampledRows++;
+            }
+          }
+
+          const span = maxX >= minX ? (maxX - minX + 1) : 0;
+          const widthRatio = span > 0 ? +(span / 120).toFixed(3) : 0.35;
+          const areaTotal = Math.max(1, (yEnd - yStart) * Math.max(1, span));
+          const fillRatio = span > 0 ? +(fgCount / areaTotal).toFixed(3) : 0.35;
+          const centerX = maxX >= minX ? (minX + maxX) / 2 : 64;
+          const centerXRatio = +((centerX - 64) / 64).toFixed(3);
+          const avgSegs = sampledRows > 0 ? Math.round(totalSegments / sampledRows) : 1;
+
+          let sliceHex = '#8B6F4E';
+          if (sc > 0) {
+            const rr = Math.round(sr / sc), gg = Math.round(sg / sc), bb = Math.round(sb / sc);
+            sliceHex = '#' + [rr, gg, bb].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+          }
+
+          slices.push({
+            index: s,
+            widthRatio,
+            fillRatio,
+            centerXRatio,
+            segmentCount: avgSegs,
+            color: sliceHex
+          });
+        }
+
+        // 만약 배경과 전경 색상이 매우 유사하여 validCount가 적다면 중앙(32..96) 픽셀로 보완
+        if (validCount < 15) {
+          for (let y = 32; y < 96; y++) {
+            for (let x = 32; x < 96; x++) {
+              const idx = (y * 128 + x) * 4;
+              const r = fullData[idx], g = fullData[idx + 1], b = fullData[idx + 2], a = fullData[idx + 3];
+              if (a < 100) continue;
+              rSum += r; gSum += g; bSum += b; validCount++;
+            }
+          }
         }
 
         let hex = '#C89D7C';
@@ -2362,12 +2790,37 @@
           subHex = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
         }
 
+        let screenColor = '#111827';
+        if (screenCount > 10) {
+          const r = Math.round(rScreenSum / screenCount);
+          const g = Math.round(gScreenSum / screenCount);
+          const b = Math.round(bScreenSum / screenCount);
+          screenColor = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+        }
+
+        // 상단(슬라이스 1~6: 모니터 패널) 폭 평균 vs 하단 넥(슬라이스 7~9: 모니터 기둥) 폭 평균 비교로 모니터/컴퓨터 형태 자동 감지
+        const topWidthAvg = (slices[1].widthRatio + slices[2].widthRatio + slices[3].widthRatio + slices[4].widthRatio + slices[5].widthRatio) / 5;
+        const neckWidthAvg = (slices[7].widthRatio + slices[8].widthRatio) / 2;
+        const baseWidthAvg = (slices[9].widthRatio + slices[10].widthRatio) / 2;
+        const screenDarkRatio = midScreenAreaPixels > 0 ? darkScreenPixels / midScreenAreaPixels : 0;
+
+        // 모니터/일체형 PC 시각적 특징: 상단 패널이 넓고(>=0.42), 중단 기둥(neck)이 좁아지며, 상단에 어두운/푸른 액정 영역이 존재함
+        const isMonitorLike = (
+          (topWidthAvg >= 0.42 && neckWidthAvg < topWidthAvg * 0.68 && screenDarkRatio >= 0.22) ||
+          (screenDarkRatio >= 0.42 && topWidthAvg >= 0.45 && baseWidthAvg <= topWidthAvg * 0.85)
+        );
+
         state.aiExtractedHex = hex;
         state.aiExtractedSubHex = subHex;
         state.aiImageStats = {
           aspect: img.naturalWidth && img.naturalHeight ? +(img.naturalWidth / img.naturalHeight).toFixed(2) : 1,
           fileName: cleanFileName,
-          uploadedAt: Date.now()
+          uploadedAt: Date.now(),
+          slices,
+          screenColor,
+          screenDarkRatio: +screenDarkRatio.toFixed(2),
+          isMonitorLike,
+          isRoundSymmetric: Math.abs(topWidthAvg - baseWidthAvg) < 0.08 && slices.every((s) => Math.abs(s.centerXRatio) < 0.1)
         };
 
         // 임시 캔버스 및 Image 객체 즉시 정리
@@ -2426,22 +2879,37 @@
       const matType = document.getElementById('ai-material-type').value || 'wood';
       const promptText = document.getElementById('ai-extra-prompt').value.trim();
 
-      // 이미지/이름/프롬프트/치수 기반 자동 형태 추론 (프리셋 선택 UI 제거)
+      // 이미지 픽셀 실루엣 + 이름/프롬프트/파일명 기반 고정밀 형태 추론 (절대 엉뚱한 원형 테이블로 기본 폴백하지 않음)
       const combinedHint = `${name} ${promptText} ${currentImageStats?.fileName || ''}`.toLowerCase();
-      let shape = 'round_slanted_table';
-      if (/소파|암체어|쿠션|의자|체어|sofa|chair|couch|armchair/.test(combinedHint)) {
+      let shape = 'modern_rect_desk';
+
+      if (/노트북|랩탑|맥북|laptop|macbook|notebook/.test(combinedHint)) {
+        shape = 'laptop_computer';
+      } else if (
+        /컴퓨터|모니터|데스크탑|본체|디스플레이|아이맥|게이밍|pc|computer|monitor|desktop|imac|display|screen/.test(combinedHint) ||
+        currentImageStats?.isMonitorLike
+      ) {
+        shape = 'computer_monitor_setup';
+      } else if (/소파|암체어|쿠션|의자|체어|sofa|chair|couch|armchair|stool/.test(combinedHint)) {
         shape = 'cushion_sofa_armchair';
-      } else if (/책장|선반|수납|장식장|부엌|shelf|bookcase|rack/.test(combinedHint) || h >= 1350) {
+      } else if (/책장|선반|수납|장식장|부엌|옷장|캐비닛|shelf|bookcase|rack|cabinet|wardrobe/.test(combinedHint) || h >= 1350) {
         shape = 'open_shelf_bookcase';
       } else if (/침대|베드|매트리스|bed|mattress/.test(combinedHint) || (w >= 1000 && d >= 1800)) {
         shape = 'bed_frame_headboard';
       } else if (/코너|ㄱ자|l자|워크스테이션|l-shape|corner/.test(combinedHint)) {
         shape = 'lshape_corner_desk';
-      } else if (/데스크|책상|사각|식탁|테이블|desk/.test(combinedHint) || Math.abs(w - d) > 200) {
-        shape = /원형|스툴|사이드|round|stool/.test(combinedHint) ? 'round_slanted_table' : 'modern_rect_desk';
+      } else if (/원형|둥근|티테이블|사이드테이블|round/.test(combinedHint)) {
+        shape = 'round_slanted_table';
+      } else if (/데스크|책상|사각|식탁|테이블|desk|table/.test(combinedHint)) {
+        shape = 'modern_rect_desk';
+      } else if (currentImageStats && Array.isArray(currentImageStats.slices) && currentImageStats.slices.length > 0) {
+        // 특정 키워드가 없더라도 이미지가 업로드된 경우: 이미지의 12단 실루엣과 부위별 색상을 그대로 입체화!
+        shape = 'image_silhouette_3d';
       }
+
       const currentBase64 = state.aiUploadedBase64 ? String(state.aiUploadedBase64) : null;
       const currentMimeType = state.aiUploadedMimeType || 'image/jpeg';
+      const currentSubColor = state.aiExtractedSubHex || '#2B2D35';
 
       progressBar.style.width = '15%';
       loadingTitle.textContent = 'AI 3D 부품 조합(Blueprint) 설계 중...';
@@ -2449,6 +2917,7 @@
 
       let blueprint = null;
       let isAIGenerated = false;
+      let apiFallbackReason = null;
 
       if (state.aiConfig.provider !== 'smart_preset') {
         try {
@@ -2466,18 +2935,22 @@
             isAIGenerated = true;
           }
         } catch (apiErr) {
-          console.warn('AI API call failed, falling back to smart procedural generator:', apiErr);
-          showToast(`AI 호출 안내: ${apiErr.message}. 정밀 파라미터 조립기로 자동 전환합니다.`);
+          console.warn('AI API call failed, falling back to built-in vision silhouette analyzer:', apiErr);
+          apiFallbackReason = apiErr.message;
         }
       }
 
       progressBar.style.width = '80%';
       stepText.textContent = isAIGenerated
         ? `AI가 ${blueprint.parts.length}개 세부 파츠 설계도를 완성했습니다! Three.js 조립 중...`
-        : '고급 디테일 파라미터 파츠 생성 알고리즘으로 3D 메쉬를 합성 중...';
+        : '내장 2D 픽셀 실루엣 & 다중 색상 분석 엔진으로 3D 메쉬를 합성 중...';
 
       if (!blueprint || !Array.isArray(blueprint.parts) || blueprint.parts.length === 0) {
-        blueprint = generateSmartBlueprint(shape, w, d, h, color, matType);
+        blueprint = generateSmartBlueprint(shape, w, d, h, color, matType, {
+          subColor: currentSubColor,
+          screenColor: currentImageStats?.screenColor || '#111827',
+          imageStats: currentImageStats
+        });
       }
 
       // 이전/이후 가구 간 참조 오염 방지를 위한 깊은 복사(Deep Copy)
@@ -2535,7 +3008,11 @@
       // 생성 완료 직후 자동으로 이미지 메모리 및 프롬프트 상태 초기화 (연속 생성 준비)
       resetAIGeneratorState({ keepFormFields: false, resetDimensions: false, showNotice: false });
 
-      showToast('✅ 3D 가구 생성 완료! 다음 가구 이미지를 업로드할 수 있습니다.');
+      if (apiFallbackReason) {
+        showToast(`⚠️ 외부/로컬 AI 미연결(${apiFallbackReason}) → 내장 비전 분석기로 '${name}' 3D 모델을 생성했습니다.`);
+      } else {
+        showToast(`✅ '${name}' 3D 모델(${isolatedBlueprint.parts.length}개 부품) 생성 완료! 다음 이미지를 업로드할 수 있습니다.`);
+      }
     } catch (err) {
       console.error('Furniture generation error:', err);
       showToast(`가구 생성 중 오류가 발생했습니다: ${err.message}`);
@@ -4400,8 +4877,15 @@
       state.aiConfig.ollamaModel = document.getElementById('ai-ollama-model').value.trim();
       saveAIConfig();
       syncAIConfigUI();
-      showToast('Ollama 로컬 서버 설정이 저장되었습니다.');
+      showToast('로컬 AI 서버(LM Studio / Ollama) 설정이 저장되었습니다.');
     });
+
+    const btnTestLocalAI = document.getElementById('btn-test-local-ai');
+    if (btnTestLocalAI) {
+      btnTestLocalAI.addEventListener('click', () => {
+        testLocalAIConnection();
+      });
+    }
 
     // AI Studio Image Dropzone & Reset Controls
     const dropzone = document.getElementById('ai-dropzone');
