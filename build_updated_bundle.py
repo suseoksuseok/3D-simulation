@@ -84,7 +84,7 @@ if 'data-tool="pan"' not in html:
 # 5. Add Pan tool chip to hud-2d-tools
 old_hud_erase = '''              <button class="hud-tool-chip" data-tool="erase">'''
 hud_pan_chip = '''              <button class="hud-tool-chip" data-tool="pan">✋ 이동</button>\n'''
-if 'data-tool="pan"' not in html[html.find('hud-2d-tools'):html.find('hud-2d-tools')+500]:
+if '<button class="hud-tool-chip" data-tool="pan">' not in html:
     html = html.replace(old_hud_erase, hud_pan_chip + old_hud_erase, 1)
 
 # 6. Add mobile drawer backdrop before center-viewport

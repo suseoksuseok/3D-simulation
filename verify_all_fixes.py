@@ -137,7 +137,6 @@ with sync_playwright() as p:
     page.click(".sidebar-tab[data-tab='tab-ai-studio']")
     page.wait_for_timeout(200)
     page.fill("#ai-furn-name", "북유럽 원목 테이블")
-    page.select_option("#ai-furn-shape", "round_slanted_table")
     page.click("#btn-generate-ai-furniture")
     page.wait_for_timeout(1500)
     vault_count = page.evaluate("state.aiVault.length")

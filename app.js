@@ -59,10 +59,18 @@
       ollamaModel: 'llama3.2-vision'
     },
 
-    // AI Upload Temp State
+    // AI Upload Temp State (Cleaned up via resetAIGeneratorState)
     aiUploadedBase64: null,
-    aiUploadedMimeType: 'image/jpeg',
+    aiUploadedMimeType: null,
     aiExtractedHex: '#C89D7C',
+    aiExtractedSubHex: '#2B2D35',
+    aiImageStats: null,
+    aiPreviewObjectUrl: null,
+    aiTempImage: null,
+    aiTempCanvas: null,
+    aiTempCtx: null,
+    isGeneratingAI: false,
+    aiFurnitureSeq: 0,
 
     // 2D Editor Interaction State
     drawTool: 'select', // 'select' | 'wall' | 'door' | 'window' | 'erase'
@@ -1840,43 +1848,53 @@
     return { parts };
   }
 
-  // ==================== [기능 2-1] AI MULTIMODAL API CALLERS ====================
+  // ==================== [기능 2-1] AI MULTIMODAL API CALLERS (100% STATELESS) ====================
   async function callAIBlueprintAPI(imageBase64, mimeType, name, W, D, H, shapeKey, userPrompt) {
     const provider = state.aiConfig.provider;
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-    const systemInstruction = `너는 3D 공간 그래픽스 엔지니어다. 사용자가 업로드한 가구 이미지와 전체 규격(가로 W, 세로 D, 높이 H mm)을 분석하여, Three.js에서 이 가구를 가장 사실적이고 입체적으로 조립할 수 있도록 하위 부품(Parts)들의 배열로 분해한 순수 JSON 데이터를 반환해라. 절대 이미지를 평면에 텍스처로 붙이지 말고, 상판(원기둥/직육면체), 다리(개수, 기울기 각도, 원뿔대/원기둥 여부), 등받이, 팔걸이, 서랍, 프레임 등 최소 4개~12개의 세부 파츠로 쪼개어 설계해라.
+    // 매 호출마다 완전히 독립된 지역 변수(Local Variables)만 사용하여 이전 대화/프롬프트 컨텍스트 누적을 원천 차단
+    const cleanBase64 = imageBase64 ? String(imageBase64).trim() : null;
+    const cleanMime = mimeType ? String(mimeType).trim() : 'image/jpeg';
+    const cleanName = name ? String(name).trim() : 'AI 커스텀 가구';
+    const cleanPrompt = userPrompt ? String(userPrompt).trim() : '';
+
+    const systemInstruction = `너는 3D 공간 그래픽스 엔지니어다. 이번 요청(ID: ${requestId})은 이전 요청과 무관한 완전히 독립적인 단일 분석 작업(Stateless Request)이다.
+사용자가 지금 업로드한 최신 가구 이미지와 전체 규격(가로 W, 세로 D, 높이 H mm)만을 분석하여, Three.js에서 이 가구를 가장 사실적이고 입체적으로 조립할 수 있도록 하위 부품(Parts)들의 배열로 분해한 순수 JSON 데이터를 반환해라. 절대 이미지를 평면에 텍스처로 붙이지 말고, 상판(원기둥/직육면체), 다리(개수, 기울기 각도, 원뿔대/원기둥 여부), 등받이, 팔걸이, 서랍, 프레임 등 최소 4개~12개의 세부 파츠로 쪼개어 설계해라.
 각 파츠(parts 배열)는 다음 속성을 가진다:
 - name: 부위 이름 (예: tabletop, leg_1, leg_2, backrest, armrest_l)
 - shape: 'box' | 'cylinder' | 'sphere' | 'rounded_box'
 - size: [width, height, depth] (단위: mm, 'cylinder'일 경우 [radiusTop, radiusBottom, height])
 - position: [x, y, z] (가구 중심 바닥 기준 상대 좌표, 단위: mm)
 - rotation: [rx, ry, rz] (단위: 도, 비스듬히 뻗은 다리 등을 표현할 때 적극 활용)
-- color: 이미지의 해당 부위에서 추출한 실제 Hex 색상 코드 (예: '#C89D7C')
+- color: 지금 업로드된 이미지의 해당 부위에서 추출한 실제 Hex 색상 코드 (예: '#C89D7C')
 - materialType: 'wood' | 'metal' | 'fabric' | 'glass' | 'plastic'
 오직 파싱 가능한 순수 JSON 객체 { "parts": [...] } 만 응답해라.`;
 
-    const userTextPrompt = `가구 이름: ${name}
+    const userTextPrompt = `[독립 요청 ID: ${requestId}]
+가구 이름: ${cleanName}
 규격: 가로(W) ${W}mm x 깊이(D) ${D}mm x 높이(H) ${H}mm
-기본 형태 스타일: ${shapeKey}
-사용자 추가 지시사항: ${userPrompt || '이미지의 형태적 특성과 비율, 다리의 기울기 각도를 최대한 반영해 입체적으로 분해해 줘.'}`;
+사용자 추가 지시사항: ${cleanPrompt || '첨부된 최신 이미지의 실제 형태, 다리 개수/각도, 등받이/선반 구조 및 색상을 있는 그대로 정밀 분석하여 입체 파츠로 분해해 줘.'}`;
 
     if (provider === 'gemini') {
       const apiKey = state.aiConfig.geminiApiKey?.trim();
       if (!apiKey) throw new Error('Gemini API 키가 입력되지 않았습니다. [키 저장] 후 다시 시도하세요.');
 
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+      const freshParts = [{ text: systemInstruction + '\n\n' + userTextPrompt }];
+      if (cleanBase64) {
+        freshParts.push({
+          inline_data: {
+            mime_type: cleanMime,
+            data: cleanBase64
+          }
+        });
+      }
+
       const payload = {
         contents: [
           {
-            parts: [
-              { text: systemInstruction + '\n\n' + userTextPrompt },
-              ...(imageBase64 ? [{
-                inline_data: {
-                  mime_type: mimeType || 'image/jpeg',
-                  data: imageBase64
-                }
-              }] : [])
-            ]
+            parts: freshParts
           }
         ],
         generationConfig: {
@@ -1901,13 +1919,13 @@
       if (!apiKey) throw new Error('OpenAI API 키가 입력되지 않았습니다. [키 저장] 후 다시 시도하세요.');
 
       const endpoint = 'https://api.openai.com/v1/chat/completions';
-      const contentParts = [
+      const freshContentParts = [
         { type: 'text', text: userTextPrompt }
       ];
-      if (imageBase64) {
-        contentParts.push({
+      if (cleanBase64) {
+        freshContentParts.push({
           type: 'image_url',
-          image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${imageBase64}` }
+          image_url: { url: `data:${cleanMime};base64,${cleanBase64}` }
         });
       }
 
@@ -1915,7 +1933,7 @@
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: systemInstruction },
-          { role: 'user', content: contentParts }
+          { role: 'user', content: freshContentParts }
         ],
         response_format: { type: 'json_object' }
       };
@@ -1944,7 +1962,7 @@
         prompt: systemInstruction + '\n\n' + userTextPrompt,
         stream: false,
         format: 'json',
-        ...(imageBase64 ? { images: [imageBase64] } : {})
+        ...(cleanBase64 ? { images: [cleanBase64] } : {})
       };
 
       const res = await fetch(url, {
@@ -2134,26 +2152,168 @@
     return group;
   }
 
-  // ==================== [기능 3] 중앙 색상 추출 (배경 제외) ====================
+  // ==================== [기능 3] 이미지 메모리 초기화 및 중앙 색상 추출 ====================
+  function clearAIImageMemory() {
+    state.aiUploadedBase64 = null;
+    state.aiUploadedMimeType = null;
+    state.aiExtractedHex = '#C89D7C';
+    state.aiExtractedSubHex = '#2B2D35';
+    state.aiImageStats = null;
+
+    if (state.aiPreviewObjectUrl) {
+      try {
+        URL.revokeObjectURL(state.aiPreviewObjectUrl);
+      } catch (_) {}
+      state.aiPreviewObjectUrl = null;
+    }
+
+    if (state.aiTempImage) {
+      state.aiTempImage.onload = null;
+      state.aiTempImage.onerror = null;
+      state.aiTempImage.src = '';
+      state.aiTempImage = null;
+    }
+
+    if (state.aiTempCanvas && state.aiTempCtx) {
+      try {
+        state.aiTempCtx.clearRect(0, 0, state.aiTempCanvas.width, state.aiTempCanvas.height);
+      } catch (_) {}
+    }
+    state.aiTempCanvas = null;
+    state.aiTempCtx = null;
+  }
+
+  function resetAIGeneratorState(options = {}) {
+    const { keepFormFields = false, resetDimensions = false, showNotice = false } = options;
+
+    // 1. 메모리에 저장된 이전 이미지 Base64, 추출 색상, Image 객체, 임시 캔버스, ObjectURL 완전 해제
+    clearAIImageMemory();
+
+    // 2. 파일 인풋 요소 초기화 (fileInput.value = "" 강제 설정으로 동일 파일이나 새 파일 재선택 시 change 이벤트 100% 보장)
+    const fileInput = document.getElementById('ai-image-input');
+    if (fileInput) {
+      fileInput.value = '';
+    }
+    const glbFileInput = document.getElementById('glb-file-input');
+    if (glbFileInput) {
+      glbFileInput.value = '';
+    }
+
+    // 3. 썸네일 미리보기 영역을 초기 안내 문구 상태로 복원
+    const previewImg = document.getElementById('ai-preview-img');
+    if (previewImg) {
+      previewImg.onload = null;
+      previewImg.src = '';
+      previewImg.removeAttribute('src');
+    }
+
+    const dropzonePrompt = document.getElementById('ai-dropzone-prompt');
+    if (dropzonePrompt) {
+      dropzonePrompt.classList.remove('hidden');
+      const spanEl = dropzonePrompt.querySelector('span');
+      if (spanEl) {
+        spanEl.textContent = '여기를 클릭하거나 새 가구 이미지를 드래그하세요';
+      }
+    }
+
+    const previewWrap = document.getElementById('ai-preview-wrap');
+    if (previewWrap) {
+      previewWrap.classList.add('hidden');
+    }
+
+    // 4. 색상 피커 및 추출 색상 표시 초기화
+    const defaultHex = '#C89D7C';
+    const fallbackColor = document.getElementById('ai-fallback-color');
+    const fallbackColorLabel = document.getElementById('ai-fallback-color-label');
+    const extractedSwatch = document.getElementById('ai-extracted-swatch');
+    const extractedHex = document.getElementById('ai-extracted-hex');
+
+    if (fallbackColor) fallbackColor.value = defaultHex;
+    if (fallbackColorLabel) fallbackColorLabel.textContent = defaultHex;
+    if (extractedSwatch) extractedSwatch.style.background = defaultHex;
+    if (extractedHex) extractedHex.textContent = defaultHex;
+
+    // 5. 프롬프트 및 가구 이름 초기화 (이전 가구 프롬프트가 다음 생성에 누적/중복 사용되는 현상 방지)
+    if (!keepFormFields) {
+      const promptEl = document.getElementById('ai-extra-prompt');
+      if (promptEl) promptEl.value = '';
+
+      const nameEl = document.getElementById('ai-furn-name');
+      if (nameEl) nameEl.value = '';
+
+      if (resetDimensions) {
+        const dimW = document.getElementById('ai-dim-w');
+        const dimD = document.getElementById('ai-dim-d');
+        const dimH = document.getElementById('ai-dim-h');
+        if (dimW) dimW.value = '650';
+        if (dimD) dimD.value = '650';
+        if (dimH) dimH.value = '520';
+
+        const matEl = document.getElementById('ai-material-type');
+        if (matEl) matEl.value = 'wood';
+
+        const logBox = document.getElementById('ai-blueprint-log');
+        if (logBox) {
+          logBox.textContent = '';
+          logBox.classList.add('hidden');
+        }
+      }
+    }
+
+    // 6. 생성 버튼 잠금(Lock) 및 로딩 상태 초기화
+    state.isGeneratingAI = false;
+    const genBtn = document.getElementById('btn-generate-ai-furniture');
+    if (genBtn) genBtn.disabled = false;
+    const loadingBox = document.getElementById('ai-loading-box');
+    if (loadingBox) loadingBox.classList.add('hidden');
+
+    if (showNotice) {
+      showToast('🔄 입력값과 이미지 메모리가 모두 초기화되었습니다. 새 가구를 준비하세요.');
+    }
+  }
+
   function handleAIImageUpload(file) {
-    if (!file || !file.type.startsWith('image/')) return;
-    state.aiUploadedMimeType = file.type;
+    if (!file || (file.type && !file.type.startsWith('image/'))) return;
+
+    // 새 이미지 업로드 즉시 이전 이미지 데이터 변수를 먼저 강제로 비움
+    clearAIImageMemory();
+
+    const mimeType = file.type || 'image/jpeg';
+    state.aiUploadedMimeType = mimeType;
+
+    // ObjectURL 생성 및 관리 (추후 resetAIGeneratorState에서 revokeObjectURL로 해제)
+    try {
+      state.aiPreviewObjectUrl = URL.createObjectURL(file);
+    } catch (_) {
+      state.aiPreviewObjectUrl = null;
+    }
+
+    const cleanFileName = (file.name || '').replace(/\.[^/.]+$/, '').trim();
 
     const reader = new FileReader();
     reader.onload = (ev) => {
-      const dataUrl = ev.target.result;
-      state.aiUploadedBase64 = dataUrl.split(',')[1];
+      const dataUrl = String(ev.target.result || '');
+      const commaIdx = dataUrl.indexOf(',');
+      state.aiUploadedBase64 = commaIdx !== -1 ? dataUrl.substring(commaIdx + 1) : dataUrl;
 
       const img = new Image();
+      state.aiTempImage = img;
+
       img.onload = () => {
         const c = document.createElement('canvas');
         c.width = 128;
         c.height = 128;
         const ctx = c.getContext('2d');
+        state.aiTempCanvas = c;
+        state.aiTempCtx = ctx;
+
+        ctx.clearRect(0, 0, 128, 128);
         ctx.drawImage(img, 0, 0, 128, 128);
 
+        // 중앙 영역(32..96) 주 색상 추출
         const imgData = ctx.getImageData(32, 32, 64, 64).data;
         let rSum = 0, gSum = 0, bSum = 0, validCount = 0;
+        let rSubSum = 0, gSubSum = 0, bSubSum = 0, subCount = 0;
 
         for (let i = 0; i < imgData.length; i += 4) {
           const r = imgData[i];
@@ -2162,8 +2322,8 @@
           const a = imgData[i + 3];
 
           if (a < 128) continue;
-          if (r < 32 && g < 32 && b < 32) continue;
-          if (r > 235 && g > 235 && b > 235) continue;
+          if (r < 28 && g < 28 && b < 28) continue;
+          if (r > 238 && g > 238 && b > 238) continue;
 
           rSum += r;
           gSum += g;
@@ -2171,25 +2331,66 @@
           validCount++;
         }
 
+        // 하단부(다리/프레임 영역) 보조 색상 추출
+        const botData = ctx.getImageData(24, 88, 80, 32).data;
+        for (let i = 0; i < botData.length; i += 4) {
+          const r = botData[i];
+          const g = botData[i + 1];
+          const b = botData[i + 2];
+          const a = botData[i + 3];
+          if (a < 128) continue;
+          if (r > 238 && g > 238 && b > 238) continue;
+          rSubSum += r;
+          gSubSum += g;
+          bSubSum += b;
+          subCount++;
+        }
+
         let hex = '#C89D7C';
-        if (validCount > 10) {
+        if (validCount > 5) {
           const r = Math.round(rSum / validCount);
           const g = Math.round(gSum / validCount);
           const b = Math.round(bSum / validCount);
           hex = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
         }
 
+        let subHex = '#2B2D35';
+        if (subCount > 5) {
+          const r = Math.round(rSubSum / subCount);
+          const g = Math.round(gSubSum / subCount);
+          const b = Math.round(bSubSum / subCount);
+          subHex = '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+        }
+
         state.aiExtractedHex = hex;
+        state.aiExtractedSubHex = subHex;
+        state.aiImageStats = {
+          aspect: img.naturalWidth && img.naturalHeight ? +(img.naturalWidth / img.naturalHeight).toFixed(2) : 1,
+          fileName: cleanFileName,
+          uploadedAt: Date.now()
+        };
+
+        // 임시 캔버스 및 Image 객체 즉시 정리
+        ctx.clearRect(0, 0, 128, 128);
+        state.aiTempCanvas = null;
+        state.aiTempCtx = null;
+        state.aiTempImage = null;
+
         document.getElementById('ai-fallback-color').value = hex;
         document.getElementById('ai-fallback-color-label').textContent = hex;
         document.getElementById('ai-extracted-swatch').style.background = hex;
         document.getElementById('ai-extracted-hex').textContent = `추출 색상: ${hex}`;
 
         const previewImg = document.getElementById('ai-preview-img');
-        previewImg.src = dataUrl;
+        previewImg.src = state.aiPreviewObjectUrl || dataUrl;
         document.getElementById('ai-dropzone-prompt').classList.add('hidden');
         document.getElementById('ai-preview-wrap').classList.remove('hidden');
+
+        // 파일 인풋 value를 즉시 비워 동일 파일 재선택 시에도 change 이벤트가 작동하도록 보장
+        const fileInput = document.getElementById('ai-image-input');
+        if (fileInput) fileInput.value = '';
       };
+
       img.src = dataUrl;
     };
     reader.readAsDataURL(file);
@@ -2197,14 +2398,7 @@
 
   // ==================== AI BLUEPRINT TRIGGER ====================
   async function triggerAIFurnitureGeneration() {
-    const name = document.getElementById('ai-furn-name').value.trim() || 'AI 커스텀 가구';
-    const shape = document.getElementById('ai-furn-shape').value;
-    const w = Math.max(200, Number(document.getElementById('ai-dim-w').value) || 650);
-    const d = Math.max(200, Number(document.getElementById('ai-dim-d').value) || 650);
-    const h = Math.max(200, Number(document.getElementById('ai-dim-h').value) || 520);
-    const color = document.getElementById('ai-fallback-color').value || state.aiExtractedHex;
-    const matType = document.getElementById('ai-material-type').value || 'wood';
-    const promptText = document.getElementById('ai-extra-prompt').value.trim();
+    if (state.isGeneratingAI) return;
 
     const loadingBox = document.getElementById('ai-loading-box');
     const loadingTitle = document.getElementById('ai-loading-title');
@@ -2213,73 +2407,119 @@
     const logBox = document.getElementById('ai-blueprint-log');
     const genBtn = document.getElementById('btn-generate-ai-furniture');
 
-    loadingBox.classList.remove('hidden');
-    logBox.classList.add('hidden');
-    genBtn.disabled = true;
-    progressBar.style.width = '15%';
-    loadingTitle.textContent = 'AI 3D 부품 조합(Blueprint) 설계 중...';
-    stepText.textContent = `엔진: ${state.aiConfig.provider.toUpperCase()} | 이미지/규격 전송 중...`;
-
-    let blueprint = null;
-    let isAIGenerated = false;
+    // 생성 잠금 설정 (finally 블록에서 100% 해제 보장)
+    state.isGeneratingAI = true;
+    if (genBtn) genBtn.disabled = true;
+    if (loadingBox) loadingBox.classList.remove('hidden');
+    if (logBox) logBox.classList.add('hidden');
 
     try {
+      // 현재 시점의 입력값과 이미지 데이터를 독립된 지역 상수로 스냅샷 캡처
+      const nextSeq = (state.aiFurnitureSeq || 0) + 1;
+      const rawName = document.getElementById('ai-furn-name').value.trim();
+      const currentImageStats = state.aiImageStats ? { ...state.aiImageStats } : null;
+      const name = rawName || (currentImageStats?.fileName ? currentImageStats.fileName : `AI 커스텀 가구 #${nextSeq}`);
+      const w = Math.max(200, Number(document.getElementById('ai-dim-w').value) || 650);
+      const d = Math.max(200, Number(document.getElementById('ai-dim-d').value) || 650);
+      const h = Math.max(200, Number(document.getElementById('ai-dim-h').value) || 520);
+      const color = document.getElementById('ai-fallback-color').value || state.aiExtractedHex || '#C89D7C';
+      const matType = document.getElementById('ai-material-type').value || 'wood';
+      const promptText = document.getElementById('ai-extra-prompt').value.trim();
+
+      // 이미지/이름/프롬프트/치수 기반 자동 형태 추론 (프리셋 선택 UI 제거)
+      const combinedHint = `${name} ${promptText} ${currentImageStats?.fileName || ''}`.toLowerCase();
+      let shape = 'round_slanted_table';
+      if (/소파|암체어|쿠션|의자|체어|sofa|chair|couch|armchair/.test(combinedHint)) {
+        shape = 'cushion_sofa_armchair';
+      } else if (/책장|선반|수납|장식장|부엌|shelf|bookcase|rack/.test(combinedHint) || h >= 1350) {
+        shape = 'open_shelf_bookcase';
+      } else if (/침대|베드|매트리스|bed|mattress/.test(combinedHint) || (w >= 1000 && d >= 1800)) {
+        shape = 'bed_frame_headboard';
+      } else if (/코너|ㄱ자|l자|워크스테이션|l-shape|corner/.test(combinedHint)) {
+        shape = 'lshape_corner_desk';
+      } else if (/데스크|책상|사각|식탁|테이블|desk/.test(combinedHint) || Math.abs(w - d) > 200) {
+        shape = /원형|스툴|사이드|round|stool/.test(combinedHint) ? 'round_slanted_table' : 'modern_rect_desk';
+      }
+      const currentBase64 = state.aiUploadedBase64 ? String(state.aiUploadedBase64) : null;
+      const currentMimeType = state.aiUploadedMimeType || 'image/jpeg';
+
+      progressBar.style.width = '15%';
+      loadingTitle.textContent = 'AI 3D 부품 조합(Blueprint) 설계 중...';
+      stepText.textContent = `엔진: ${state.aiConfig.provider.toUpperCase()} | 이미지/규격 독립 전송 중...`;
+
+      let blueprint = null;
+      let isAIGenerated = false;
+
       if (state.aiConfig.provider !== 'smart_preset') {
-        progressBar.style.width = '45%';
-        stepText.textContent = '멀티모달 Vision 분석 및 Three.js JSON 파츠 분해 중...';
-        blueprint = await callAIBlueprintAPI(
-          state.aiUploadedBase64,
-          state.aiUploadedMimeType,
-          name,
-          w, d, h,
-          shape,
-          promptText
-        );
-        if (blueprint && Array.isArray(blueprint.parts) && blueprint.parts.length > 0) {
-          isAIGenerated = true;
+        try {
+          progressBar.style.width = '45%';
+          stepText.textContent = '멀티모달 Vision 분석 및 Three.js JSON 파츠 분해 중...';
+          blueprint = await callAIBlueprintAPI(
+            currentBase64,
+            currentMimeType,
+            name,
+            w, d, h,
+            shape,
+            promptText
+          );
+          if (blueprint && Array.isArray(blueprint.parts) && blueprint.parts.length > 0) {
+            isAIGenerated = true;
+          }
+        } catch (apiErr) {
+          console.warn('AI API call failed, falling back to smart procedural generator:', apiErr);
+          showToast(`AI 호출 안내: ${apiErr.message}. 정밀 파라미터 조립기로 자동 전환합니다.`);
         }
       }
-    } catch (err) {
-      console.warn('AI API call failed, falling back to smart procedural generator:', err);
-      showToast(`AI 호출 오류: ${err.message}. 정밀 파라미터 조립기로 자동 전환합니다.`);
-    }
 
-    progressBar.style.width = '80%';
-    stepText.textContent = isAIGenerated
-      ? `AI가 ${blueprint.parts.length}개 세부 파츠 설계도를 완성했습니다! Three.js 조립 중...`
-      : '고급 디테일 파라미터 파츠 생성 알고리즘으로 3D 메쉬를 합성 중...';
+      progressBar.style.width = '80%';
+      stepText.textContent = isAIGenerated
+        ? `AI가 ${blueprint.parts.length}개 세부 파츠 설계도를 완성했습니다! Three.js 조립 중...`
+        : '고급 디테일 파라미터 파츠 생성 알고리즘으로 3D 메쉬를 합성 중...';
 
-    if (!blueprint || !Array.isArray(blueprint.parts) || blueprint.parts.length === 0) {
-      blueprint = generateSmartBlueprint(shape, w, d, h, color, matType);
-    }
+      if (!blueprint || !Array.isArray(blueprint.parts) || blueprint.parts.length === 0) {
+        blueprint = generateSmartBlueprint(shape, w, d, h, color, matType);
+      }
 
-    logBox.textContent = `// AI 3D Furniture Blueprint JSON (${isAIGenerated ? 'Online API' : 'Smart Procedural'})\n` + JSON.stringify(blueprint, null, 2);
-    logBox.classList.remove('hidden');
+      // 이전/이후 가구 간 참조 오염 방지를 위한 깊은 복사(Deep Copy)
+      const isolatedBlueprint = JSON.parse(JSON.stringify(blueprint));
 
-    setTimeout(() => {
+      logBox.textContent = `// AI 3D Furniture Blueprint JSON (${isAIGenerated ? 'Online API' : 'Smart Procedural'})\n` + JSON.stringify(isolatedBlueprint, null, 2);
+      logBox.classList.remove('hidden');
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
       progressBar.style.width = '100%';
-      loadingBox.classList.add('hidden');
-      genBtn.disabled = false;
+
+      // 고유 ID 부여: Date.now() + 순번 + 랜덤 문자열 조합 (이전 메쉬 덮어쓰기 방지)
+      state.aiFurnitureSeq = nextSeq;
+      const randStr = Math.random().toString(36).substring(2, 7);
+      const uniqueId = `ai_furniture_${nextSeq}_${Date.now()}_${randStr}`;
+
+      // 연속 생성 시 이전 가구와 완전히 겹치지 않도록 순번에 따른 스마트 오프셋 배치
+      const existingAICount = state.furnitureList.filter((f) => f.isAI).length;
+      const offsetX = existingAICount === 0 ? 0 : ((existingAICount % 3) - 1) * 320;
+      const offsetZ = existingAICount === 0 ? 0 : (Math.floor(existingAICount / 3) % 3) * 320;
 
       const newItemData = {
-        id: 'ai_' + Date.now(),
-        catalogId: 'ai_' + Date.now(),
+        id: uniqueId,
+        catalogId: uniqueId,
         name,
         category: 'decor',
         shape,
         w, d, h,
-        x: 0, y: 0, z: 0,
+        x: offsetX,
+        y: 0,
+        z: offsetZ,
         rotY: 0,
         color,
         materialType: matType,
-        blueprintData: blueprint,
+        blueprintData: isolatedBlueprint,
         isAI: true,
         tag: isAIGenerated ? 'AI Vision' : 'AI Blueprint',
         ergoClearance: { front: 550, side: 200 }
       };
 
       state.furnitureList.push(newItemData);
-      const meshGroup = buildFurnitureFromAIJson(blueprint, newItemData);
+      const meshGroup = buildFurnitureFromAIJson(isolatedBlueprint, newItemData);
       furnitureGroup.add(meshGroup);
       furnitureMeshMap.set(newItemData.id, meshGroup);
 
@@ -2290,8 +2530,21 @@
       selectFurniture(newItemData.id);
       evaluateAllCollisions();
       draw2DFloorplan();
-      showToast(`3D 가구 '${name}' 조립 완료 (${blueprint.parts.length}개 파츠 입체 결합)!`);
-    }, 500);
+      HistoryManager.pushState();
+
+      // 생성 완료 직후 자동으로 이미지 메모리 및 프롬프트 상태 초기화 (연속 생성 준비)
+      resetAIGeneratorState({ keepFormFields: false, resetDimensions: false, showNotice: false });
+
+      showToast('✅ 3D 가구 생성 완료! 다음 가구 이미지를 업로드할 수 있습니다.');
+    } catch (err) {
+      console.error('Furniture generation error:', err);
+      showToast(`가구 생성 중 오류가 발생했습니다: ${err.message}`);
+    } finally {
+      // 어떤 경우에도 락(Lock) 해제 및 로딩 바 숨김 처리 100% 보장
+      state.isGeneratingAI = false;
+      if (genBtn) genBtn.disabled = false;
+      if (loadingBox) loadingBox.classList.add('hidden');
+    }
   }
 
   // ==================== FURNITURE CRUD & SELECTION ====================
@@ -4150,17 +4403,21 @@
       showToast('Ollama 로컬 서버 설정이 저장되었습니다.');
     });
 
-    // AI Studio Image Dropzone
+    // AI Studio Image Dropzone & Reset Controls
     const dropzone = document.getElementById('ai-dropzone');
     const fileInput = document.getElementById('ai-image-input');
 
     dropzone.addEventListener('click', (e) => {
       if (e.target.id === 'btn-remove-ai-img') return;
+      // 클릭 시마다 value를 비워 같은 파일을 다시 선택해도 change 이벤트가 항상 발생하도록 보장
+      fileInput.value = '';
       fileInput.click();
     });
 
     fileInput.addEventListener('change', (e) => {
-      if (e.target.files && e.target.files[0]) handleAIImageUpload(e.target.files[0]);
+      if (e.target.files && e.target.files[0]) {
+        handleAIImageUpload(e.target.files[0]);
+      }
     });
 
     dropzone.addEventListener('dragover', (e) => {
@@ -4173,16 +4430,29 @@
     dropzone.addEventListener('drop', (e) => {
       e.preventDefault();
       dropzone.classList.remove('dragover');
-      if (e.dataTransfer.files && e.dataTransfer.files[0]) handleAIImageUpload(e.dataTransfer.files[0]);
+      if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+        handleAIImageUpload(e.dataTransfer.files[0]);
+      }
     });
 
     document.getElementById('btn-remove-ai-img').addEventListener('click', (e) => {
       e.stopPropagation();
-      state.aiUploadedBase64 = null;
-      fileInput.value = '';
-      document.getElementById('ai-dropzone-prompt').classList.remove('hidden');
-      document.getElementById('ai-preview-wrap').classList.add('hidden');
+      resetAIGeneratorState({ keepFormFields: true, showNotice: false });
     });
+
+    const btnResetHeader = document.getElementById('btn-reset-ai-header');
+    if (btnResetHeader) {
+      btnResetHeader.addEventListener('click', () => {
+        resetAIGeneratorState({ keepFormFields: false, resetDimensions: true, showNotice: true });
+      });
+    }
+
+    const btnResetGenerator = document.getElementById('btn-reset-ai-generator');
+    if (btnResetGenerator) {
+      btnResetGenerator.addEventListener('click', () => {
+        resetAIGeneratorState({ keepFormFields: false, resetDimensions: true, showNotice: true });
+      });
+    }
 
     document.getElementById('ai-fallback-color').addEventListener('input', (e) => {
       document.getElementById('ai-fallback-color-label').textContent = e.target.value.toUpperCase();
@@ -4361,6 +4631,11 @@
   window.loadFloorplanPreset = loadFloorplanPreset;
   window.setDrawTool = setDrawTool;
   window.switchViewportMode = switchViewportMode;
+  window.resetAIGeneratorState = resetAIGeneratorState;
+  window.clearAIImageMemory = clearAIImageMemory;
+  window.handleAIImageUpload = handleAIImageUpload;
+  window.triggerAIFurnitureGeneration = triggerAIFurnitureGeneration;
+  window.callAIBlueprintAPI = callAIBlueprintAPI;
 
   // ==================== RENDER LOOP ====================
   function animate() {
